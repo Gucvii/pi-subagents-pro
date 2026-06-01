@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.0] - 2026-05-30
+## [0.10.0] - 2026-06-01
 
 > **⚠️ Breaking: `extensions:` and `tools:` in agent frontmatter semantics changed.** The `extensions: [...]` array now selects which extensions *load*, not which tool names surface. Agents that previously used the array form will behave differently — see migration below. The `tools:` field also grew new `ext:` and `*` selector forms; existing `tools:` values without these selectors are unchanged.
 > - `extensions: [...]` is now an **extension allowlist applied at load time**, not a tool-name substring filter. Each entry is an extension *name*, a *path* (absolute, `~/`-prefixed, or relative-to-cwd), or `"*"`. **Migration:** `extensions: ["mcp"]` previously loaded *every* extension and then surfaced only tools whose names contained `mcp`. To keep all extensions, use `extensions: true` or `extensions: "*"`. To narrow, name the extensions or point at their files. `"*"` composes: `extensions: "*, /abs/path/extra-ext.ts"` is all defaults plus one path-loaded.
