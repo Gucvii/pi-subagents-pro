@@ -33,6 +33,9 @@ export interface AgentConfig {
   disallowedTools?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   extensions: true | string[] | false;
+  /** Extension-name denylist applied after the `extensions:` include set. Exclude wins.
+   * Plain canonical names only (case-insensitive); no paths, no wildcard. */
+  excludeExtensions?: string[];
   /** true = inherit all, string[] = only listed, false = none */
   skills: true | string[] | false;
   model?: string;

@@ -296,6 +296,9 @@ export async function runAgent(
 
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
+  // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
+  // isolation is an intentional override, not a misconfiguration.
+  const excludeExtensions = options.isolated ? undefined : config.excludeExtensions;
   const skills = options.isolated ? false : config.skills;
 
   // Skill preloading: when skills is string[], preload their content into prompt
@@ -373,18 +376,35 @@ export async function runAgent(
     ? parseExtensionsSpec(extensions, effectiveCwd)
     : undefined;
   const keepNames = extensionsSpec?.names ?? new Set<string>();
-  // The override filters loaded extensions down to `keepNames`. It's only needed
-  // when we're neither loading everything (`extensions: true` or a `"*"` wildcard)
-  // nor nothing (`noExtensions`).
+  // `exclude_extensions:` is a denylist applied AFTER the include set — exclude wins.
+  // Plain canonical names only (case-insensitive). Note: excluded extensions'
+  // factories still run once during reload() (see comment above) — exclusion
+  // suppresses handler binding and tool registration; it is not a sandbox.
+  const excludeNames = new Set((excludeExtensions ?? []).map((n) => n.toLowerCase()));
+  const hasExcludes = excludeNames.size > 0;
+  // The override filters loaded extensions down to `keepNames` minus `excludeNames`.
+  // It's only needed when we're neither loading everything without excludes
+  // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
   const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  // Pre-filter discovered set, captured by the override — the exclude-typo warning
+  // must compare against this, not the surviving set (absence from survivors is
+  // an exclude *succeeding*).
+  let discoveredNames: Set<string> | undefined;
   const extensionsOverride: ((base: LoadExtensionsResult) => LoadExtensionsResult) | undefined =
-    loadAll || noExtensions
+    noExtensions || (loadAll && !hasExcludes)
       ? undefined
-      : (base) => ({
-          ...base,
-          extensions: base.extensions.filter((e) => keepNames.has(extensionCanonicalName(e.path))),
-        });
+      : (base) => {
+          discoveredNames = new Set(base.extensions.map((e) => extensionCanonicalName(e.path)));
+          return {
+            ...base,
+            extensions: base.extensions.filter((e) => {
+              const name = extensionCanonicalName(e.path);
+              if (excludeNames.has(name)) return false; // exclude wins
+              return loadAll || keepNames.has(name);
+            }),
+          };
+        };
 
   const loader = new DefaultResourceLoader({
     cwd: effectiveCwd,
@@ -425,6 +445,27 @@ export async function runAgent(
   //   - `tools: ext:foo` but foo isn't in the loaded set (because `extensions:`
   //     didn't include it). Since v0.9, `ext:` no longer pulls extensions in;
   //     loading is `extensions:`-authoritative.
+  // An exclude_extensions: alongside extensions: false is contradictory — nothing
+  // loads, so there is nothing to exclude.
+  if (hasExcludes && noExtensions) {
+    options.onToolActivity?.({
+      type: "end",
+      toolName: `extension-error:exclude_extensions has no effect for agent "${type}" — extensions: false loads nothing`,
+    });
+  }
+  // Exclude typo check: compares against the PRE-filter discovered set (an excluded
+  // name absent from the surviving set is the exclude working as intended). Also
+  // flags path-like and "*" entries — excludes are plain names only.
+  if (hasExcludes && discoveredNames) {
+    for (const name of excludeNames) {
+      if (!discoveredNames.has(name)) {
+        options.onToolActivity?.({
+          type: "end",
+          toolName: `extension-error:exclude_extensions: "${name}" for agent "${type}" did not match any discovered extension`,
+        });
+      }
+    }
+  }
   if (keepNames.size > 0 || extNames.size > 0) {
     const survivingNames = new Set(
       loader.getExtensions().extensions.map((e) => extensionCanonicalName(e.path)),
@@ -433,7 +474,9 @@ export async function runAgent(
       if (!survivingNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
-          toolName: `extension-error:extension "${name}" requested by agent "${type}" was not loaded`,
+          toolName: excludeNames.has(name)
+            ? `extension-error:extension "${name}" is in both extensions: and exclude_extensions: for agent "${type}" — exclude wins`
+            : `extension-error:extension "${name}" requested by agent "${type}" was not loaded`,
         });
       }
     }
@@ -441,7 +484,7 @@ export async function runAgent(
       if (!survivingNames.has(name)) {
         options.onToolActivity?.({
           type: "end",
-          toolName: `extension-error:ext:${name} referenced by agent "${type}" but extension "${name}" is not loaded (add it to extensions:)`,
+          toolName: `extension-error:ext:${name} referenced by agent "${type}" but extension "${name}" is not loaded (check extensions:/exclude_extensions:)`,
         });
       }
     }
