@@ -163,6 +163,39 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
   });
 
+  it("spawns a FRONTMATTER-defined (.agents/agents/*.md) agent and its prompt reaches the child", async () => {
+    const MARKER = "SPYMARKER_AGENTS_FRONTMATTER_REACHED_CHILD";
+    const cwd = mkdtempSync(join(tmpdir(), "subagents-agents-fm-"));
+    tmpDirs.push(cwd);
+    mkdirSync(join(cwd, ".agents", "agents"), { recursive: true });
+    writeFileSync(
+      join(cwd, ".agents", "agents", "agents-spy.md"),
+      `---\ndescription: "Echoes a marker from the .agents/agents workspace dir."\n---\n${MARKER}\n`,
+    );
+
+    run = await runPrintMode({
+      prompt: "Delegate to the agents-spy agent.",
+      cwd,
+      respond: routeBySession({
+        parentInitial: agentCall({
+          subagent_type: "agents-spy",
+          description: "echo workspace",
+          prompt: "Report what you were told.",
+          run_in_background: false,
+        }),
+        parentFinal: "Reported.",
+        subagent: (ctx: Context) =>
+          `child saw: ${ctx.systemPrompt?.includes(MARKER) ? MARKER : "MISSING"}`,
+      }),
+    });
+
+    const toolResults = agentToolResults(run.parentSession);
+    expect(toolResults.length).toBe(1);
+    expect(toolResults[0]).toContain(MARKER);
+    expect(toolResults[0]).not.toContain("MISSING");
+    expect(toolResults[0]).not.toMatch(/Unknown agent type/i);
+  });
+
   it("errors clearly when faux mode is given no script", async () => {
     await expect(runPrintMode({ prompt: "x" })).rejects.toThrow(/provide `respond` or `steps`/);
   });

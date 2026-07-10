@@ -261,7 +261,7 @@ export default function (pi: ExtensionAPI) {
     }
   );
 
-  /** Reload agents from .pi/agents/*.md and merge with defaults (called on init and each Agent invocation). */
+  /** Reload agents from project/global custom agent dirs and merge with defaults (called on init and each Agent invocation). */
   const reloadCustomAgents = () => {
     const userAgents = loadCustomAgents(process.cwd());
     registerAgents(userAgents);
@@ -569,8 +569,8 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Disable default agents configuration ----
   // When enabled, the three hardcoded default agents (general-purpose, Explore,
-  // Plan) are not registered. User-defined agents from .pi/agents/*.md are
-  // completely unaffected — only DEFAULT_AGENTS are suppressed.
+  // Plan) are not registered. User-defined agents from project/global custom
+  // agent dirs are completely unaffected — only DEFAULT_AGENTS are suppressed.
   // Defaults to false; opt-in via `/agents → Settings` or subagents.json.
   // State lives in agent-types.ts (isDefaultsDisabled) because registerAgents
   // needs it; this wrapper just re-registers after flipping it.
@@ -988,7 +988,7 @@ Terse command-style prompts produce shallow, generic work.
       // Ensure we have UI context for widget rendering
       widget.setUICtx(ctx.ui as UICtx);
 
-      // Reload custom agents so new .pi/agents/*.md files are picked up without restart
+      // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
       const rawType = params.subagent_type as SubagentType;
@@ -1486,12 +1486,15 @@ Terse command-style prompts produce shallow, generic work.
   // ---- /agents interactive menu ----
 
   const projectAgentsDir = () => join(process.cwd(), ".pi", "agents");
+  const workspaceAgentsDir = () => join(process.cwd(), ".agents", "agents");
   const personalAgentsDir = () => join(getAgentDir(), "agents");
 
-  /** Find the file path of a custom agent by name (project first, then global). */
-  function findAgentFile(name: string): { path: string; location: "project" | "personal" } | undefined {
+  /** Find the file path of a custom agent by name, in discovery-precedence order (project, workspace, then global). */
+  function findAgentFile(name: string): { path: string; location: "project" | "workspace" | "personal" } | undefined {
     const projectPath = join(projectAgentsDir(), `${name}.md`);
     if (existsSync(projectPath)) return { path: projectPath, location: "project" };
+    const workspacePath = join(workspaceAgentsDir(), `${name}.md`);
+    if (existsSync(workspacePath)) return { path: workspacePath, location: "workspace" };
     const personalPath = join(personalAgentsDir(), `${name}.md`);
     if (existsSync(personalPath)) return { path: personalPath, location: "personal" };
     return undefined;
