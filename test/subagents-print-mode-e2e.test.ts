@@ -210,6 +210,9 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
 // and assert robust invariants (a real spawn happened and produced output).
 // Per-feature determinism lives in the faux suite above, which scripts exact calls.
 const LIVE_TIMEOUT = 150_000;
+// SELF-SMOKE chains three live spawns in one session; passing runs land ~145s,
+// so it gets extra headroom over the single-feature tests.
+const SELF_SMOKE_TIMEOUT = 300_000;
 
 describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
   let run: PrintModeRun | undefined;
@@ -296,7 +299,7 @@ describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
           "   working directory in one line.",
           "Finish with: 'SELF-SMOKE COMPLETE' followed by the PASS/FAIL lines.",
         ].join("\n"),
-        timeoutMs: LIVE_TIMEOUT,
+        timeoutMs: SELF_SMOKE_TIMEOUT,
       });
 
       const calls = agentToolCalls(run.parentSession);
@@ -321,6 +324,6 @@ describe.runIf(LIVE)("subagents print-mode e2e (live LLM, opt-in)", () => {
       // The agent ran the whole script to completion and self-reported.
       expect(run.responseText).toMatch(/SELF-SMOKE COMPLETE/i);
     },
-    LIVE_TIMEOUT,
+    SELF_SMOKE_TIMEOUT,
   );
 });
