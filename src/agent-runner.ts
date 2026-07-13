@@ -2,8 +2,9 @@
  * agent-runner.ts — Core execution engine: creates sessions, runs agents, collects results.
  */
 
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
@@ -53,6 +54,58 @@ export function extensionCanonicalName(extPath: string): string {
     ? basename(dirname(extPath))
     : base.replace(/\.(ts|js)$/, "");
   return name.toLowerCase();
+}
+
+/**
+ * The unscoped, lowercased npm short name of the pi package that DECLARES
+ * `extPath` as an extension entry — or undefined if the entry doesn't belong to
+ * such a package. Walks up to the first `package.json` (the package boundary,
+ * never crossing into a parent/monorepo package) and returns its `name` only
+ * when its `pi.extensions` manifest actually lists this entry. That "declares
+ * this entry" check is deliberate: our own test fixtures live under this repo,
+ * whose root manifest declares `./src/index.ts` as `@tintinweb/pi-subagents`, so
+ * a looser "nearest package.json name" rule would misattribute every co-located
+ * file to `pi-subagents`.
+ */
+function extensionPackageName(extPath: string): string | undefined {
+  const entry = resolve(extPath);
+  let dir = dirname(extPath);
+  for (;;) {
+    let pkg: { name?: unknown; pi?: { extensions?: unknown } };
+    try {
+      pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf-8"));
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) return undefined; // walked to the filesystem root
+      dir = parent;
+      continue;
+    }
+    // First package.json wins — it's the package boundary; decide here.
+    const entries = pkg.pi?.extensions;
+    if (
+      typeof pkg.name === "string" &&
+      Array.isArray(entries) &&
+      entries.some((e) => typeof e === "string" && resolve(dir, e) === entry)
+    ) {
+      const short = pkg.name.startsWith("@") ? pkg.name.slice(pkg.name.indexOf("/") + 1) : pkg.name;
+      return short.toLowerCase();
+    }
+    return undefined;
+  }
+}
+
+/**
+ * All names an extension answers to for allowlist matching (lowercased): its
+ * path-derived {@link extensionCanonicalName} plus, when a pi package manifest
+ * declares this entry, that package's unscoped short name (`@scope/foo` → `foo`).
+ * #143: an extension installed via `pi.extensions: ["./src/index.ts"]` would
+ * otherwise only ever match as `src` (the source directory), never by its
+ * package name. The path-derived name is preserved, so it keeps matching too.
+ */
+export function extensionCanonicalNames(extPath: string): string[] {
+  const canonical = extensionCanonicalName(extPath);
+  const pkg = extensionPackageName(extPath);
+  return pkg && pkg !== canonical ? [canonical, pkg] : [canonical];
 }
 
 /**
@@ -456,13 +509,13 @@ export async function runAgent(
     noExtensions || (loadAll && !hasExcludes)
       ? undefined
       : (base) => {
-          discoveredNames = new Set(base.extensions.map((e) => extensionCanonicalName(e.path)));
+          discoveredNames = new Set(base.extensions.flatMap((e) => extensionCanonicalNames(e.path)));
           return {
             ...base,
             extensions: base.extensions.filter((e) => {
-              const name = extensionCanonicalName(e.path);
-              if (excludeNames.has(name)) return false; // exclude wins
-              return loadAll || keepNames.has(name);
+              const canons = extensionCanonicalNames(e.path);
+              if (canons.some((n) => excludeNames.has(n))) return false; // exclude wins
+              return loadAll || canons.some((n) => keepNames.has(n));
             }),
           };
         };
@@ -529,7 +582,7 @@ export async function runAgent(
   }
   if (keepNames.size > 0 || extNames.size > 0) {
     const survivingNames = new Set(
-      loader.getExtensions().extensions.map((e) => extensionCanonicalName(e.path)),
+      loader.getExtensions().extensions.flatMap((e) => extensionCanonicalNames(e.path)),
     );
     for (const name of keepNames) {
       if (!survivingNames.has(name)) {
@@ -574,9 +627,11 @@ export async function runAgent(
   if (!noExtensions) {
     const optInActive = extNames.size > 0;
     for (const extension of loader.getExtensions().extensions) {
-      const canon = extensionCanonicalName(extension.path);
-      if (optInActive && !extNames.has(canon)) continue;
-      const narrowed = narrowing.get(canon);
+      const canons = extensionCanonicalNames(extension.path);
+      if (optInActive && !canons.some((c) => extNames.has(c))) continue;
+      // First alias that carries a narrowing set — a user won't narrow one
+      // extension under two different names, so first-match is correct.
+      const narrowed = canons.map((c) => narrowing.get(c)).find(Boolean);
       for (const toolName of extension.tools.keys()) {
         if (narrowed && !narrowed.has(toolName)) continue;
         extensionToolNames.push(toolName);

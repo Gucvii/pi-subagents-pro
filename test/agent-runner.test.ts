@@ -1,5 +1,7 @@
-import { homedir } from "node:os";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const {
   createAgentSession,
@@ -107,6 +109,7 @@ vi.mock("../src/skill-loader.js", () => ({
 
 import {
   extensionCanonicalName,
+  extensionCanonicalNames,
   getAgentConversation,
   parseExtensionsSpec,
   parseExtSelectors,
@@ -820,6 +823,49 @@ describe("extensionCanonicalName", () => {
   });
 });
 
+describe("extensionCanonicalNames (#143 — package short name alias)", () => {
+  const tmpDirs: string[] = [];
+  function pkgDir(name: string, piExtensions: unknown): string {
+    const dir = mkdtempSync(join(tmpdir(), "subagents-pkg-"));
+    tmpDirs.push(dir);
+    const manifest: Record<string, unknown> = { name };
+    if (piExtensions !== undefined) manifest.pi = { extensions: piExtensions };
+    writeFileSync(join(dir, "package.json"), JSON.stringify(manifest));
+    mkdirSync(join(dir, "src"));
+    writeFileSync(join(dir, "src", "index.ts"), "export default () => {};");
+    return dir;
+  }
+  afterEach(() => {
+    while (tmpDirs.length) rmSync(tmpDirs.pop()!, { recursive: true, force: true });
+  });
+
+  it("aliases a package-declared index.ts entry to the unscoped, lowercased package name", () => {
+    // Without this, `pi.extensions: ["./src/index.ts"]` only ever matches as "src".
+    const dir = pkgDir("@tintinweb/Pi-Subagents", ["./src/index.ts"]);
+    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src", "pi-subagents"]);
+  });
+
+  it("adds no alias for a loose file with no enclosing package.json", () => {
+    const dir = mkdtempSync(join(tmpdir(), "subagents-loose-"));
+    tmpDirs.push(dir);
+    writeFileSync(join(dir, "foo.ts"), "export default () => {};");
+    expect(extensionCanonicalNames(join(dir, "foo.ts"))).toEqual(["foo"]);
+  });
+
+  it("adds no alias when the nearest manifest does not declare this entry", () => {
+    // The package.json is a real pi package but lists a *different* entry — so a
+    // co-located file (e.g. our own test fixtures under this repo) is not falsely
+    // stamped with the package name.
+    const dir = pkgDir("@scope/other-ext", ["./src/other.ts"]);
+    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src"]);
+  });
+
+  it("adds no alias when the nearest package.json has no pi manifest", () => {
+    const dir = pkgDir("just-a-project", undefined);
+    expect(extensionCanonicalNames(join(dir, "src", "index.ts"))).toEqual(["src"]);
+  });
+});
+
 describe("parseExtensionsSpec", () => {
   it("classifies bare entries as names", () => {
     const spec = parseExtensionsSpec(["mcp", "logger"], "/work");
@@ -901,6 +947,34 @@ describe("agent-runner extension allowlist", () => {
     expect(tools).toContain("mcp");
     expect(tools).toContain("mcp_call");
     expect(tools).not.toContain("other_tool");
+  });
+
+  it("matches a package-installed extension by its package short name, not just its src dir (#143)", async () => {
+    // A package whose entry is `src/index.ts` canonicalizes to "src"; a child
+    // agent must still be able to allowlist it by the package name.
+    const dir = mkdtempSync(join(tmpdir(), "subagents-match-"));
+    try {
+      writeFileSync(
+        join(dir, "package.json"),
+        JSON.stringify({ name: "@tintinweb/pi-subagents", pi: { extensions: ["./src/index.ts"] } }),
+      );
+      mkdirSync(join(dir, "src"));
+      writeFileSync(join(dir, "src", "index.ts"), "export default () => {};");
+      const entry = join(dir, "src", "index.ts");
+
+      setupArrayAgent(["pi-subagents"]);
+      withExtensions({ [entry]: ["pkg_tool"] });
+      const { session } = createSession("OK");
+      createAgentSession.mockResolvedValue({ session });
+
+      await runAgent(ctx, "Explore", "go", { pi });
+
+      // Before the fix keepNames={pi-subagents} but the extension only answered
+      // to "src", so it was filtered out and pkg_tool never reached the allowlist.
+      expect(lastToolsPassed()).toContain("pkg_tool");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("an absolute path is added to additionalExtensionPaths and its extension survives", async () => {
