@@ -63,6 +63,32 @@ describe("agent invocation presentation", () => {
     ]);
   });
 
+  it("shows a clean inheritance state, then updates the same card with the resolved identity", () => {
+    const call = {
+      displayName: "Agent",
+      prompt: "Inspect the repository.",
+      runInBackground: false,
+      inheritContext: false,
+    };
+    const component = renderAgentCallCard(call, theme);
+
+    expect(component.render(200).map(line => line.trimEnd())).toContain(
+      "  inherits main · fresh context",
+    );
+
+    const updated = renderAgentCallCard({
+      ...call,
+      model: "openai-codex/gpt-5.6-sol",
+      thinking: "medium",
+    }, theme, component);
+
+    expect(updated).toBe(component);
+    expect(updated.render(200).map(line => line.trimEnd())).toContain(
+      "  openai-codex/gpt-5.6-sol · effort medium · fresh context",
+    );
+    expect(updated.render(200).join("\n")).not.toContain("<inherit main>");
+  });
+
   it("normalizes and truncates prompt previews", () => {
     expect(formatPromptPreview(" first\n\n second ")).toBe("first second");
     expect(formatPromptPreview("123456", 5)).toBe("1234…");

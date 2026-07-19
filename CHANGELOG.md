@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Agent calls now inherit the main agent's model and effort when omitted.** `model`, `thinking`, and the UI-only `description` are optional; descriptions derive from the task prompt, while new and scheduled runs still require `subagent_type` at runtime and resumed runs reuse their original execution identity. Explicit model overrides remain strict exact `provider/modelId` values, scheduled jobs freeze the resolved identity at creation, and the built-in `Explore` agent no longer pins Haiku, so all default agents follow the main session unless deliberately overridden.
 
+### Fixed
+- **Agent invocation cards now replace inheritance placeholders with the resolved execution identity.** Before execution, omitted identity fields render as a single clean `inherits main` state; once validation resolves the child identity, the same card updates in place to the exact `provider/modelId` and effort. Running and completion stats no longer duplicate model/effort already shown by the call card.
 ## [0.14.2] - 2026-07-17
 
 ### Added

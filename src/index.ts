@@ -64,8 +64,8 @@ export interface AgentCallDisplay {
   displayName: string;
   description?: string;
   prompt: string;
-  model: string;
-  thinking: string;
+  model?: string;
+  thinking?: string;
   runInBackground: boolean;
   inheritContext: boolean;
 }
@@ -90,6 +90,7 @@ export function deriveAgentDescription(prompt: string, maxLength = 60): string {
 export function renderAgentCallCard(
   call: AgentCallDisplay,
   theme: Pick<Theme, "fg" | "bold">,
+  existing?: Text,
 ): Text {
   const mode = call.runInBackground ? "BACKGROUND" : "FOREGROUND";
   const { model, thinking } = call;
@@ -103,16 +104,20 @@ export function renderAgentCallCard(
     description +
     "  " +
     theme.fg(call.runInBackground ? "warning" : "success", mode);
+  const identity = model && thinking
+    ? theme.fg("accent", model) + theme.fg("dim", " · ") + theme.fg("warning", `effort ${thinking}`)
+    : model
+      ? theme.fg("accent", model) + theme.fg("dim", " · ") + theme.fg("muted", "inherits main effort")
+      : thinking
+        ? theme.fg("muted", "inherits main model") + theme.fg("dim", " · ") + theme.fg("warning", `effort ${thinking}`)
+        : theme.fg("muted", "inherits main");
   const metadata =
-    "  " +
-    theme.fg("accent", model) +
-    theme.fg("dim", " · ") +
-    theme.fg("warning", `effort ${thinking}`) +
-    theme.fg("dim", " · ") +
-    theme.fg("muted", context);
+    "  " + identity + theme.fg("dim", " · ") + theme.fg("muted", context);
   const prompt = `  ${theme.fg("dim", "└─ prompt")} ${theme.fg("toolOutput", formatPromptPreview(call.prompt))}`;
 
-  return new Text([header, metadata, prompt].join("\n"), 0, 0);
+  const component = existing ?? new Text("", 0, 0);
+  component.setText([header, metadata, prompt].join("\n"));
+  return component;
 }
 
 export function renderRunningAgentStatus(
@@ -989,6 +994,9 @@ Terse command-style prompts produce shallow, generic work.
     }
     return fullAgentToolDescription;
   })();
+  type ResolvedCallIdentity = { model: string; thinking: NonNullable<AgentInvocation["thinking"]> };
+  type AgentCallRenderState = { resolvedIdentity?: ResolvedCallIdentity };
+  const agentCallIdentitySetters = new Map<string, (identity: ResolvedCallIdentity) => void>();
 
   pi.registerTool(defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
@@ -1072,19 +1080,29 @@ Terse command-style prompts produce shallow, generic work.
 
     // ---- Custom rendering: Claude Code style ----
 
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const rawType = args.subagent_type as SubagentType | undefined;
       const resolvedType = rawType ? (resolveType(rawType) ?? "general-purpose") : "general-purpose";
       const invocation = resolveAgentInvocationConfig(getAgentConfig(resolvedType), args);
+      const state = context.state as AgentCallRenderState;
+      if (!agentCallIdentitySetters.has(context.toolCallId) && agentCallIdentitySetters.size >= 500) {
+        const oldest = agentCallIdentitySetters.keys().next().value;
+        if (oldest) agentCallIdentitySetters.delete(oldest);
+      }
+      agentCallIdentitySetters.set(context.toolCallId, (identity) => {
+        state.resolvedIdentity = identity;
+        context.invalidate();
+      });
+      const identity = state.resolvedIdentity;
       return renderAgentCallCard({
         displayName: rawType ? getDisplayName(resolvedType) : "Agent",
         description: args.description,
         prompt: args.prompt ?? "",
-        model: invocation.modelInput ?? "<inherit main>",
-        thinking: invocation.thinking ?? "<inherit main>",
+        model: identity?.model ?? invocation.modelInput,
+        thinking: identity?.thinking ?? invocation.thinking,
         runInBackground: invocation.runInBackground,
         inheritContext: invocation.inheritContext,
-      }, theme);
+      }, theme, context.lastComponent instanceof Text ? context.lastComponent : undefined);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
@@ -1094,11 +1112,10 @@ Terse command-style prompts produce shallow, generic work.
         return new Text(text, 0, 0);
       }
 
-      // Helper: build "haiku · thinking: high · ↻5≤30 · 3 tool uses · 33.8k tokens" stats string
+      // The call card owns model/effort; result stats show only non-identity execution data.
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
-        if (d.modelName) parts.push(d.modelName);
-        if (d.tags) parts.push(...d.tags);
+        if (d.tags) parts.push(...d.tags.filter(tag => !tag.startsWith("thinking: ")));
         if (d.turnCount != null && d.turnCount > 0) {
           parts.push(formatTurns(d.turnCount, d.maxTurns));
         }
@@ -1251,6 +1268,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
       }
+      agentCallIdentitySetters.get(toolCallId)?.({ model: modelName, thinking });
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
