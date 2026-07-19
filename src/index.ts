@@ -11,19 +11,21 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { AgentSessionStore, findPersistedAgentRecord, resolveAgentSessionStorePath, resolveAgentSessionStorePathFromParts, resolveDurableAgentSessionStorePath } from "./agent-session-store.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { resolveSessionLineage } from "./lineage.js";
+import { resolveExactModel } from "./model-resolver.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
@@ -56,6 +58,61 @@ import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsag
 /** Tool execute return value for a text response. */
 function textResult(msg: string, details?: AgentDetails) {
   return { content: [{ type: "text" as const, text: msg }], details: details as any };
+}
+
+export interface AgentCallDisplay {
+  displayName: string;
+  description?: string;
+  prompt: string;
+  model: string;
+  thinking: string;
+  runInBackground: boolean;
+  inheritContext: boolean;
+}
+
+/** Collapse a prompt into a readable one-line preview for the invocation card. */
+export function formatPromptPreview(prompt: string, maxLength = 140): string {
+  const compact = prompt.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+/** Derive stable UI metadata when the caller omits a description. */
+export function deriveAgentDescription(prompt: string, maxLength = 60): string {
+  const compact = prompt.replace(/\s+/g, " ").trim();
+  if (!compact) return "Subagent task";
+  const firstSentence = compact.match(/^.*?(?:[.!?。！？](?:\s|$)|$)/)?.[0]?.trim() ?? compact;
+  if (firstSentence.length <= maxLength) return firstSentence;
+  return `${firstSentence.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+/** Render a compact, information-first card before an agent starts. */
+export function renderAgentCallCard(
+  call: AgentCallDisplay,
+  theme: Pick<Theme, "fg" | "bold">,
+): Text {
+  const mode = call.runInBackground ? "BACKGROUND" : "FOREGROUND";
+  const { model, thinking } = call;
+  const context = call.inheritContext ? "forked context" : "fresh context";
+  const description = call.description ? `  ${theme.fg("muted", call.description)}` : "";
+
+  const header =
+    theme.fg("accent", "◆") +
+    " " +
+    theme.fg("toolTitle", theme.bold(call.displayName)) +
+    description +
+    "  " +
+    theme.fg(call.runInBackground ? "warning" : "success", mode);
+  const metadata =
+    "  " +
+    theme.fg("accent", model) +
+    theme.fg("dim", " · ") +
+    theme.fg("warning", `effort ${thinking}`) +
+    theme.fg("dim", " · ") +
+    theme.fg("muted", context);
+  const prompt = `  ${theme.fg("dim", "└─ prompt")} ${theme.fg("toolOutput", formatPromptPreview(call.prompt))}`;
+
+  return new Text([header, metadata, prompt].join("\n"), 0, 0);
 }
 
 export function renderRunningAgentStatus(
@@ -124,15 +181,6 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 }
 
 /**
- * Advertised thinking levels, ordered to mirror pi-ai's EXTENDED_THINKING_LEVELS
- * (`off` + every `ThinkingLevel`). Single source for the Agent tool description,
- * the generated-agent template, and the `/agents` wizard so these lists can't
- * drift behind pi again (#147). Availability of any level still depends on the
- * host pi version and the selected model — pi clamps unsupported levels down.
- */
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
-
-/**
  * Salvaged partial output of a failed run, as a labeled suffix for the error
  * surfaces (or "" if the run produced nothing). `record.result` is bounded to
  * the run's own turns, so this is never a stale earlier answer (#144).
@@ -159,13 +207,15 @@ function escapeXml(s: string): string {
 }
 
 /** Format a structured task notification matching Claude Code's <task-notification> XML. */
-function formatTaskNotification(record: AgentRecord, resultMaxLen: number): string {
+export function formatTaskNotification(record: AgentRecord, resultMaxLen: number): string {
   const status = getStatusLabel(record.status, record.error);
   const durationMs = record.completedAt ? record.completedAt - record.startedAt : 0;
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
   const contextPercent = getSessionContextPercent(record.session);
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
+  const modelXml = record.invocation?.modelName ? `<model>${escapeXml(record.invocation.modelName)}</model>` : "";
+  const thinkingXml = record.invocation?.thinking ? `<thinking>${record.invocation.thinking}</thinking>` : "";
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -180,6 +230,8 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number): stri
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
+    modelXml,
+    thinkingXml,
     `<result>${escapeXml(resultPreview)}</result>`,
     `<usage><total_tokens>${totalTokens}</total_tokens><tool_uses>${record.toolUses}</tool_uses>${ctxXml}${compactXml}<duration_ms>${durationMs}</duration_ms></usage>`,
     `</task-notification>`,
@@ -208,13 +260,15 @@ function buildDetails(
 }
 
 /** Build notification details for the custom message renderer. */
-function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
+export function buildNotificationDetails(record: AgentRecord, resultMaxLen: number, activity?: AgentActivity): NotificationDetails {
   const totalTokens = getLifetimeTotal(record.lifetimeUsage);
 
   return {
     id: record.id,
     description: record.description,
     status: record.status,
+    modelName: record.invocation?.modelName,
+    thinking: record.invocation?.thinking,
     toolUses: record.toolUses,
     turnCount: activity?.turnCount ?? 0,
     maxTurns: activity?.maxTurns,
@@ -248,14 +302,16 @@ export default function (pi: ExtensionAPI) {
         // Line 1: icon + agent description + status
         let line = `${icon} ${theme.bold(d.description)} ${theme.fg("dim", statusText)}`;
 
-        // Line 2: stats
+        // Line 2: execution identity + stats
         const parts: string[] = [];
+        if (d.modelName) parts.push(theme.fg("accent", d.modelName));
+        if (d.thinking) parts.push(theme.fg("warning", `effort ${d.thinking}`));
         if (d.turnCount > 0) parts.push(formatTurns(d.turnCount, d.maxTurns));
         if (d.toolUses > 0) parts.push(`${d.toolUses} tool use${d.toolUses === 1 ? "" : "s"}`);
         if (d.totalTokens > 0) parts.push(formatTokens(d.totalTokens));
         if (d.durationMs > 0) parts.push(formatMs(d.durationMs));
         if (parts.length) {
-          line += "\n  " + parts.map(p => theme.fg("dim", p)).join(" " + theme.fg("dim", "·") + " ");
+          line += "\n  " + parts.map(p => fgPreservingNestedStyles(theme, "dim", p)).join(" " + theme.fg("dim", "·") + " ");
         }
 
         // Line 3: result preview (collapsed) or full (expanded)
@@ -392,9 +448,25 @@ export default function (pi: ExtensionAPI) {
       status: record.status,
       toolUses: record.toolUses,
       durationMs,
+      lineage: record.lineage,
       tokens,
     };
   }
+
+  // Stores are keyed by the owning parent-session path, not the currently open
+  // UI session. Background completions therefore remain attached to their
+  // original parent even if the user switches sessions mid-run.
+  const agentSessionStores = new Map<string, AgentSessionStore>();
+  const parentSessionsByRoot = new Map<string, ExtensionContext["sessionManager"]>();
+  const parentSessionsById = new Map<string, ExtensionContext["sessionManager"]>();
+  const getAgentSessionStore = (path: string): AgentSessionStore => {
+    let store = agentSessionStores.get(path);
+    if (!store) {
+      store = new AgentSessionStore(path);
+      agentSessionStores.set(path, store);
+    }
+    return store;
+  };
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
@@ -412,6 +484,8 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      lineage: record.lineage, sessionFile: record.sessionFile,
+      invocation: record.invocation,
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -443,6 +517,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id,
       type: record.type,
       description: record.description,
+      lineage: record.lineage,
     });
   }, (record, info) => {
     // Emit compacted event when agent's session compacts (preserves count on record).
@@ -454,6 +529,23 @@ export default function (pi: ExtensionAPI) {
       tokensBefore: info.tokensBefore,
       compactionCount: record.compactionCount,
     });
+  }, undefined, (record) => {
+    const parentSession = (record.parentSessionId ? parentSessionsById.get(record.parentSessionId) : undefined)
+      ?? parentSessionsByRoot.get(record.lineage.rootAgentId);
+    const storePath = resolveDurableAgentSessionStorePath(
+      getAgentDir(),
+      record.parentCwd,
+      record.parentSessionId,
+    ) ?? resolveAgentSessionStorePathFromParts(record.parentSessionDir, record.parentSessionId)
+      ?? resolveAgentSessionStorePath(parentSession);
+    if (storePath) {
+      record.parentSessionId ??= parentSession?.getSessionId?.();
+      record.parentSessionDir ??= parentSession?.getSessionDir?.() || (() => {
+        const file = parentSession?.getSessionFile?.();
+        return file ? dirname(file) : undefined;
+      })();
+      getAgentSessionStore(storePath).upsert(record);
+    }
   });
 
   // Expose manager via Symbol.for() global registry for cross-package access.
@@ -516,6 +608,40 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     manager.clearCompleted(true);
+    try {
+      const lineage = resolveSessionLineage(
+        ctx.sessionManager,
+        manager.getMaxTreeLevels(),
+        ctx.getSystemPrompt?.(),
+      );
+      parentSessionsByRoot.set(lineage.rootAgentId, ctx.sessionManager);
+      parentSessionsById.set(ctx.sessionManager.getSessionId(), ctx.sessionManager);
+      const storePath = resolveDurableAgentSessionStorePath(
+        getAgentDir(),
+        ctx.cwd,
+        ctx.sessionManager.getSessionId(),
+      ) ?? resolveAgentSessionStorePath(ctx.sessionManager);
+      if (storePath) {
+        const store = getAgentSessionStore(storePath);
+        const parentSessionDir = ctx.sessionManager.getSessionDir() || (() => {
+          const file = ctx.sessionManager.getSessionFile();
+          return file ? dirname(file) : undefined;
+        })();
+        const restored = manager.restorePersisted(store.list().map((record) => ({
+          ...record,
+          parentCwd: record.parentCwd ?? ctx.cwd,
+          parentSessionId: record.parentSessionId ?? ctx.sessionManager.getSessionId(),
+          parentSessionDir: record.parentSessionDir ?? parentSessionDir,
+        })));
+        if (restored > 0) {
+          pi.events.emit("subagents:sessions_restored", { count: restored, rootAgentId: lineage.rootAgentId });
+          widget.update();
+          fleet.update();
+        }
+      }
+    } catch (error) {
+      console.warn("[pi-subagents] Failed to restore durable Agent sessions:", error);
+    }
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
     // fires once per activation, but a double-bind must not leak listeners.
     if (!rpcHandle) {
@@ -694,9 +820,8 @@ export default function (pi: ExtensionAPI) {
 
     return available.map((name) => {
       const cfg = getAgentConfig(name);
-      const modelSuffix = cfg?.model ? ` (${getModelLabelFromConfig(cfg.model)})` : "";
       const toolsSuffix = ` (Tools: ${formatToolsSuffix(cfg)})`;
-      return `- ${name}: ${cfg?.description ?? name}${modelSuffix}${toolsSuffix}`;
+      return `- ${name}: ${cfg?.description ?? name}${toolsSuffix}`;
     }).join("\n");
   };
 
@@ -713,20 +838,13 @@ export default function (pi: ExtensionAPI) {
       return `- ${name}: ${firstSentence(cfg?.description ?? name)} (Tools: ${formatToolsSuffix(cfg)})`;
     }).join("\n");
 
-  /** Derive a short model label from a model string. */
-  function getModelLabelFromConfig(model: string): string {
-    // Strip provider prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6")
-    const name = model.includes("/") ? model.split("/").pop()! : model;
-    // Strip trailing date suffix (e.g. "claude-haiku-4-5-20251001" → "claude-haiku-4-5")
-    return name.replace(/-\d{8}$/, "");
-  }
-
   // Apply persisted settings on startup and emit `subagents:settings_loaded`.
   // Global + project merged; missing → defaults; corrupt file emits a warning
   // to stderr and falls back to defaults.
   applyAndEmitLoaded(
     {
       setMaxConcurrent: (n) => manager.setMaxConcurrent(n),
+      setMaxTreeLevels: (n) => manager.setMaxTreeLevels(n),
       setDefaultMaxTurns,
       setGraceTurns,
       setDefaultJoinMode,
@@ -774,10 +892,12 @@ ${buildCompactTypeListText()}
 Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
 
 Notes:
-- description: 3-5 words (shown in UI). Prompts must be self-contained — the agent has not seen this conversation.
+- description is optional UI metadata; when omitted it is derived from the prompt. Prompts must be self-contained — the agent has not seen this conversation.
+- model and thinking are optional; when omitted they inherit the main agent's current model and effort.
 - Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.
+- resume continues a previous agent by ID, including after restarting Pi when the parent session is reopened; steer_subagent messages a running one.
+- Nested delegation is bounded by maxTreeLevels (default 3, counting main as level 1). If Agent is available, delegate only when useful; maximum-level agents cannot spawn again.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
@@ -795,18 +915,18 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 
 ## Usage notes
 
-- Always include a short (3-5 word) description summarizing what the agent will do (shown in UI).
+- A short description is useful UI metadata but optional; Agent derives one from the prompt when omitted.
 - When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
 - Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
 - Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
-- Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
+- Use resume with an agent ID to continue a previous agent's durable Pi session, including after restarting Pi and reopening the parent session. A new (non-resume) Agent call starts a fresh agent, so its prompt must still be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
-- Use thinking to control extended thinking level.
+- Omit model and thinking to inherit the main agent's current model and effort; specify exact values only when the child should differ.
+- Nested delegation is bounded by maxTreeLevels (default 3, counting the main agent as level 1). A maximum-level agent does not receive Agent tools; never try to bypass the limit.
 - Use inherit_context if the agent needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
@@ -880,26 +1000,40 @@ Terse command-style prompts produce shallow, generic work.
       "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
+      "Nested delegation is hard-bounded by maxTreeLevels (default 3, counting the main agent as level 1). Delegate only when it materially helps; maximum-level agents cannot spawn another generation.",
     ],
     parameters: Type.Object({
       prompt: Type.String({
         description: "The task for the agent to perform.",
       }),
-      description: Type.String({
-        description: "A short (3-5 word) description of the task (shown in UI).",
-      }),
-      subagent_type: Type.String({
-        description: `The type of specialized agent to use. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-      }),
+      description: Type.Optional(
+        Type.String({
+          description: "Optional short description shown in UI. Derived from the prompt when omitted.",
+        }),
+      ),
+      subagent_type: Type.Optional(
+        Type.String({
+          description: `Agent type for a new or scheduled run. Required unless resume is provided. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
+        }),
+      ),
       model: Type.Optional(
         Type.String({
           description:
-            'Optional model override. Accepts "provider/modelId" or fuzzy name (e.g. "haiku", "sonnet"). Omit to use the agent type\'s default.',
+            'Optional exact model override in "provider/modelId" form. Omit to inherit the agent definition when pinned, otherwise the main agent model.',
+          pattern: "^[^/\\s]+/[^/\\s]+$",
         }),
       ),
       thinking: Type.Optional(
-        Type.String({
-          description: `Thinking level: ${THINKING_LEVELS.join(", ")}. Overrides agent default.`,
+        Type.Union([
+          Type.Literal("off"),
+          Type.Literal("minimal"),
+          Type.Literal("low"),
+          Type.Literal("medium"),
+          Type.Literal("high"),
+          Type.Literal("xhigh"),
+          Type.Literal("max"),
+        ], {
+          description: "Optional effort override. Omit to inherit the agent definition when pinned, otherwise the main agent effort.",
         }),
       ),
       max_turns: Type.Optional(
@@ -939,9 +1073,18 @@ Terse command-style prompts produce shallow, generic work.
     // ---- Custom rendering: Claude Code style ----
 
     renderCall(args, theme) {
-      const displayName = args.subagent_type ? getDisplayName(args.subagent_type) : "Agent";
-      const desc = args.description ?? "";
-      return new Text("▸ " + theme.fg("toolTitle", theme.bold(displayName)) + (desc ? "  " + theme.fg("muted", desc) : ""), 0, 0);
+      const rawType = args.subagent_type as SubagentType | undefined;
+      const resolvedType = rawType ? (resolveType(rawType) ?? "general-purpose") : "general-purpose";
+      const invocation = resolveAgentInvocationConfig(getAgentConfig(resolvedType), args);
+      return renderAgentCallCard({
+        displayName: rawType ? getDisplayName(resolvedType) : "Agent",
+        description: args.description,
+        prompt: args.prompt ?? "",
+        model: invocation.modelInput ?? "<inherit main>",
+        thinking: invocation.thinking ?? "<inherit main>",
+        runInBackground: invocation.runInBackground,
+        inheritContext: invocation.inheritContext,
+      }, theme);
     },
 
     renderResult(result, { expanded, isPartial }, theme) {
@@ -1033,60 +1176,81 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
-      const rawType = params.subagent_type as SubagentType;
+      if (!params.resume && !params.subagent_type) {
+        return textResult("Agent requires `subagent_type` for a new or scheduled run.");
+      }
+
+      const rawType = (params.subagent_type ?? "general-purpose") as SubagentType;
       const resolved = resolveType(rawType);
       const subagentType = resolved ?? "general-purpose";
       const fellBack = resolved === undefined;
 
       const displayName = getDisplayName(subagentType);
+      const description = params.description?.trim() || deriveAgentDescription(params.prompt);
 
-      // Get agent config (if any)
+      // Get agent config (if any). Explicit call values win; otherwise a custom
+      // agent pin wins; otherwise new runs inherit the main agent identity.
       const customConfig = getAgentConfig(subagentType);
-
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
-      let model = ctx.model;
-      if (resolvedConfig.modelInput) {
-        const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
-        if (typeof resolved === "string") {
-          if (resolvedConfig.modelFromParams) return textResult(resolved);
-          // config-specified: silent fallback to parent
-        } else {
-          model = resolved;
+      let resumeRecord = params.resume ? manager.getRecord(params.resume) : undefined;
+      if (params.resume && !resumeRecord) {
+        const persisted = findPersistedAgentRecord(getAgentDir(), ctx.cwd, params.resume);
+        if (persisted) {
+          getAgentSessionStore(persisted.storePath);
+          manager.restorePersisted([persisted.record]);
+          resumeRecord = manager.getRecord(params.resume);
         }
       }
+      if (params.resume && !resumeRecord) {
+        return textResult(`Agent not found: "${params.resume}".`);
+      }
+      if (params.resume && !resumeRecord?.session && !resumeRecord?.sessionFile) {
+        return textResult(`Agent "${params.resume}" has no durable session to resume.`);
+      }
+      const resumedModelName = resumeRecord?.invocation?.modelName ?? (resumeRecord?.session?.model
+        ? `${resumeRecord.session.model.provider}/${resumeRecord.session.model.id}`
+        : undefined);
+      const resumedThinking = resumeRecord?.invocation?.thinking ?? resumeRecord?.session?.thinkingLevel;
 
-      // Scope validation: the effective resolved model is checked against the
-      // user's enabledModels list (read in `enabled-models.ts`).
-      //
-      // Design: scopeModels guards against *runtime* LLM choices, not user-level config.
-      //   - Caller-supplied out-of-scope → hard error (the orchestrator made an explicit
-      //     out-of-scope choice; surface it so it picks differently).
-      //   - Frontmatter-pinned or parent-inherited out-of-scope → warn but proceed (the
-      //     user authored/installed this agent or chose the parent's model; trust it).
-      // See SubagentsSettings.scopeModels docstring for the full policy.
-      if (isScopeModelsEnabled() && model) {
+      const parentModelName = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+      const modelInput = params.resume
+        ? params.model ?? resumedModelName
+        : resolvedConfig.modelInput ?? parentModelName;
+      if (!modelInput) {
+        return textResult("Agent cannot inherit a model because the main agent has no active model.");
+      }
+      const resolvedModel = resolveExactModel(modelInput, ctx.modelRegistry);
+      if (typeof resolvedModel === "string") return textResult(resolvedModel);
+      const model = resolvedModel;
+      const modelName = `${model.provider}/${model.id}`;
+
+      const thinking = (params.resume
+        ? params.thinking ?? resumedThinking
+        : resolvedConfig.thinking ?? pi.getThinkingLevel()) as AgentInvocation["thinking"];
+      if (!thinking) {
+        return textResult("Agent cannot inherit effort because the main agent has no active thinking level.");
+      }
+
+      if (params.resume && (resumedModelName !== modelName || resumedThinking !== thinking)) {
+        return textResult(
+          `Resume identity mismatch for "${params.resume}". ` +
+          `Use model="${resumedModelName}" and thinking="${resumedThinking}" to continue the existing session.`,
+        );
+      }
+
+      // Validate the effective model, whether selected explicitly, pinned by a
+      // custom agent, or inherited from the main agent.
+      if (isScopeModelsEnabled()) {
         const allowed = resolveEnabledModels(readEnabledModels(ctx.cwd), ctx.modelRegistry, ctx.cwd);
         if (allowed && !isModelInScope(model, allowed)) {
-          if (resolvedConfig.modelFromParams) {
-            const list = [...allowed].sort().map(m => `  ${m}`).join("\n");
-            return textResult(
-              `Model not in scope: "${resolvedConfig.modelInput}".\n\n` +
-              `Allowed models (from enabledModels):\n${list}`,
-            );
-          }
-          // Frontmatter-pinned or parent-inherited: warn + proceed.
-          const agentLabel = customConfig?.displayName ?? subagentType;
-          const modelLabel = resolvedConfig.modelInput ?? `${model.provider}/${model.id}`;
-          ctx.ui.notify(
-            `Agent "${agentLabel}" using out-of-scope model "${modelLabel}"`,
-            "warning",
+          const list = [...allowed].sort().map(candidate => `  ${candidate}`).join("\n");
+          return textResult(
+            `Model not in scope: "${modelInput}".\n\n` +
+            `Allowed models (from enabledModels):\n${list}`,
           );
         }
       }
-
-      const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
@@ -1103,11 +1267,6 @@ Terse command-style prompts produce shallow, generic work.
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
       };
 
-      const parentModelId = ctx.model?.id;
-      const effectiveModelId = model?.id;
-      const modelName = effectiveModelId && effectiveModelId !== parentModelId
-        ? (model?.name ?? effectiveModelId).replace(/^Claude\s+/i, "").toLowerCase()
-        : undefined;
       const effectiveMaxTurns = normalizeMaxTurns(resolvedConfig.maxTurns ?? getDefaultMaxTurns());
       const agentInvocation: AgentInvocation = {
         modelName,
@@ -1126,7 +1285,7 @@ Terse command-style prompts produce shallow, generic work.
       const agentTags = modeLabel ? [modeLabel, ...invocationTags] : invocationTags;
       const detailBase = {
         displayName,
-        description: params.description,
+        description,
         subagentType,
         modelName,
         tags: agentTags.length > 0 ? agentTags : undefined,
@@ -1151,13 +1310,13 @@ Terse command-style prompts produce shallow, generic work.
         }
         try {
           const job = scheduler.addJob({
-            name: params.description as string,
-            description: params.description as string,
+            name: description,
+            description,
             schedule: params.schedule as string,
             subagent_type: subagentType,
             prompt: params.prompt as string,
-            model: params.model as string | undefined,
-            thinking: thinking,
+            model: modelName,
+            thinking,
             max_turns: effectiveMaxTurns,
             isolated: isolated,
             isolation: isolation,
@@ -1173,16 +1332,14 @@ Terse command-style prompts produce shallow, generic work.
         }
       }
 
-      // Resume existing agent
+      // Resume existing agent. Identity was resolved and validated above.
       if (params.resume) {
-        const existing = manager.getRecord(params.resume);
-        if (!existing) {
-          return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
-        }
-        if (!existing.session) {
-          return textResult(`Agent "${params.resume}" has no active session to resume.`);
-        }
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          pi,
+          ctx,
+          model,
+          thinkingLevel: thinking,
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -1216,7 +1373,7 @@ Terse command-style prompts produce shallow, generic work.
 
         try {
           id = manager.spawn(pi, ctx, subagentType, params.prompt, {
-            description: params.description,
+            description,
             model,
             maxTurns: effectiveMaxTurns,
             isolated,
@@ -1262,8 +1419,9 @@ Terse command-style prompts produce shallow, generic work.
         pi.events.emit("subagents:created", {
           id,
           type: subagentType,
-          description: params.description,
+          description,
           isBackground: true,
+          lineage: record?.lineage,
         });
 
         const isQueued = record?.status === "queued";
@@ -1271,7 +1429,7 @@ Terse command-style prompts produce shallow, generic work.
           `Agent ${isQueued ? "queued" : "started"} in background.\n` +
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
-          `Description: ${params.description}\n` +
+          `Description: ${description}\n` +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
@@ -1331,18 +1489,20 @@ Terse command-style prompts produce shallow, generic work.
         }
       };
 
-      // Animate spinner at ~80ms (smooth rotation through 10 braille frames)
+      // Cap foreground animation at 4 FPS. Faster tool-result updates trigger
+      // full TUI redraws and visibly flicker beside rich renderers such as
+      // pi-tool-display.
       const spinnerInterval = setInterval(() => {
         spinnerFrame++;
         streamUpdate();
-      }, 80);
+      }, 250);
 
       streamUpdate();
 
       let record: AgentRecord;
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
-          description: params.description,
+          description,
           model,
           maxTurns: effectiveMaxTurns,
           isolated,
@@ -1555,24 +1715,6 @@ Terse command-style prompts produce shallow, generic work.
     return undefined;
   }
 
-  function getModelLabel(type: string, registry?: ModelRegistry): string {
-    const cfg = getAgentConfig(type);
-    if (!cfg?.model) return "inherit"; // no model configured → really inherits parent
-    const label = getModelLabelFromConfig(cfg.model);
-    if (!registry) return label;
-    const resolved = resolveModel(cfg.model, registry);
-    // Configured but unresolvable: the runtime silently falls back to the parent
-    // model, so flag it (and the fallback) rather than hiding the config.
-    if (typeof resolved === "string") return `${label} (unavailable, fallback: inherit)`;
-    // Surface what it actually resolved to when that differs from the config —
-    // e.g. a provider fallback or a looser version pin. Cosmetic separator/date
-    // differences are normalized away so an effectively-identical match stays quiet.
-    const resolvedFull = `${resolved.provider}/${resolved.id}`;
-    const norm = (s: string) => s.toLowerCase().replace(/\./g, "-").replace(/-\d{8}$/, "");
-    if (norm(cfg.model) === norm(resolvedFull)) return label;
-    return `${label} (→ ${resolvedFull.replace(/-\d{8}$/, "")})`;
-  }
-
   async function showAgentsMenu(ctx: ExtensionCommandContext) {
     reloadCustomAgents();
     const allNames = getAllTypes();
@@ -1650,21 +1792,24 @@ Terse command-style prompts produce shallow, generic work.
       return "   ";
     };
 
-    // One row per agent (name in the left column, model on the right); the
-    // full description renders below the highlighted row via SettingsList,
-    // exactly like the Settings menu — so long descriptions never wrap the list.
+    // One row per agent (name in the left column, effective identity policy on
+    // the right); the full description renders below the highlighted row via
+    // SettingsList, so long descriptions never wrap the list.
     const items: SettingItem[] = allNames.map(name => {
       const cfg = getAgentConfig(name);
       const disabled = cfg?.enabled === false;
-      const model = getModelLabel(name, ctx.modelRegistry);
+      const executionIdentity = [
+        cfg?.model ?? "inherit main model",
+        cfg?.thinking ? `effort ${cfg.thinking}` : "inherit main effort",
+      ].join(" · ");
       return {
         id: name,
         label: `${sourceIndicator(cfg)}${name}`,
-        currentValue: model,
+        currentValue: executionIdentity,
         description: disabled ? "(disabled)" : (cfg?.description ?? name),
         // Single-value list so Enter "activates" the row (fires onChange with the
         // agent's id) without offering anything to actually cycle.
-        values: [model],
+        values: [executionIdentity],
       };
     });
 
@@ -1969,9 +2114,8 @@ The file format is a markdown file with YAML frontmatter and a system prompt bod
 ---
 description: <one-line description shown in UI>
 tools: <comma-separated built-in tools: read, bash, edit, write, grep, find, ls. Use "none" for no tools. Omit for all tools>
-model: <optional model as "provider/modelId", e.g. "anthropic/claude-haiku-4-5". Omit to inherit parent model>
-thinking: <optional thinking level: ${THINKING_LEVELS.join(", ")}. Omit to inherit>
 max_turns: <optional max agentic turns. 0 or omit for unlimited (default)>
+persist_session: <optional false for memory-only execution. Omit for durable cross-restart resume (default)>
 prompt_mode: <"replace" (body IS the full system prompt) or "append" (body is appended to default prompt). Default: replace>
 extensions: <true (inherit all MCP/extension tools), false (none), or comma-separated names. Default: true>
 skills: <true (inherit all), false (none), or comma-separated skill names to preload into prompt. Default: true>
@@ -1999,9 +2143,23 @@ Guidelines for choosing settings:
 
 Write the file using the write tool. Only write the file, nothing else.`;
 
+    const generationModel = ctx.model;
+    if (!generationModel) {
+      ctx.ui.notify("Cannot generate an agent without an active model.", "warning");
+      return;
+    }
+    const generationThinking = pi.getThinkingLevel();
+    const generationModelName = `${generationModel.provider}/${generationModel.id}`;
     const { record } = await manager.spawnAndWait(pi, ctx, "general-purpose", generatePrompt, {
       description: `Generate ${name} agent`,
+      model: generationModel,
+      thinkingLevel: generationThinking,
       maxTurns: 5,
+      invocation: {
+        modelName: generationModelName,
+        thinking: generationThinking,
+        runInBackground: false,
+      },
     });
 
     if (record.status === "error") {
@@ -2044,41 +2202,14 @@ Write the file using the write tool. Only write the file, nothing else.`;
       tools = customTools;
     }
 
-    // 4. Model
-    const modelChoice = await ctx.ui.select("Model", [
-      "inherit (parent model)",
-      "haiku",
-      "sonnet",
-      "opus",
-      "custom...",
-    ]);
-    if (!modelChoice) return;
-
-    let modelLine = "";
-    if (modelChoice === "haiku") modelLine = "\nmodel: anthropic/claude-haiku-4-5";
-    else if (modelChoice === "sonnet") modelLine = "\nmodel: anthropic/claude-sonnet-4-6";
-    else if (modelChoice === "opus") modelLine = "\nmodel: anthropic/claude-opus-4-6";
-    else if (modelChoice === "custom...") {
-      const customModel = await ctx.ui.input("Model (provider/modelId)");
-      if (customModel) modelLine = `\nmodel: ${customModel}`;
-    }
-
-    // 5. Thinking
-    // "inherit" is a UI-only pseudo-choice (omit the field); the rest mirror pi.
-    const thinkingChoice = await ctx.ui.select("Thinking level", ["inherit", ...THINKING_LEVELS]);
-    if (!thinkingChoice) return;
-
-    let thinkingLine = "";
-    if (thinkingChoice !== "inherit") thinkingLine = `\nthinking: ${thinkingChoice}`;
-
-    // 6. System prompt
+    // 4. System prompt
     const systemPrompt = await ctx.ui.editor("System prompt", "");
     if (systemPrompt === undefined) return;
 
     // Build the file
     const content = `---
 description: ${description}
-tools: ${tools}${modelLine}${thinkingLine}
+tools: ${tools}
 prompt_mode: replace
 ---
 
@@ -2102,6 +2233,7 @@ ${systemPrompt}
   function snapshotSettings(): SubagentsSettings {
     return {
       maxConcurrent: manager.getMaxConcurrent(),
+      maxTreeLevels: manager.getMaxTreeLevels(),
       // 0 = unlimited — per SubagentsSettings.defaultMaxTurns docstring and
       // normalizeMaxTurns() in agent-runner.ts (which maps 0 → undefined).
       defaultMaxTurns: getDefaultMaxTurns() ?? 0,
@@ -2117,11 +2249,12 @@ ${systemPrompt}
     };
   }
 
-  const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns"]);
+  const NUMERIC_IDS = new Set(["maxConcurrent", "maxTreeLevels", "defaultMaxTurns", "graceTurns"]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
+      const mtl = manager.getMaxTreeLevels();
       const dmt = getDefaultMaxTurns() ?? 0;
       const gt = getGraceTurns();
 
@@ -2132,6 +2265,13 @@ ${systemPrompt}
           description: "Max concurrent background agents (Enter to type)",
           currentValue: String(mc),
           values: [String(mc)],
+        },
+        {
+          id: "maxTreeLevels",
+          label: "Max tree levels",
+          description: "Total levels including the main agent (default 3; Enter to type)",
+          currentValue: String(mtl),
+          values: [String(mtl)],
         },
         {
           id: "defaultMaxTurns",
@@ -2212,6 +2352,12 @@ ${systemPrompt}
         if (n >= 1) {
           manager.setMaxConcurrent(n);
           notifyApplied(ctx, `Max concurrency set to ${n}`);
+        }
+      } else if (id === "maxTreeLevels") {
+        const n = parseInt(value, 10);
+        if (n >= 1 && n <= 16) {
+          manager.setMaxTreeLevels(n);
+          notifyApplied(ctx, `Max tree levels set to ${n}`);
         }
       } else if (id === "defaultMaxTurns") {
         const n = parseInt(value, 10);
@@ -2316,15 +2462,19 @@ ${systemPrompt}
     if (result && NUMERIC_IDS.has(result)) {
       const current = result === "maxConcurrent"
         ? String(manager.getMaxConcurrent())
-        : result === "defaultMaxTurns"
-          ? String(getDefaultMaxTurns() ?? 0)
-          : String(getGraceTurns());
+        : result === "maxTreeLevels"
+          ? String(manager.getMaxTreeLevels())
+          : result === "defaultMaxTurns"
+            ? String(getDefaultMaxTurns() ?? 0)
+            : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
-        : result === "defaultMaxTurns"
-          ? "Default max turns (0 = unlimited)"
-          : "Grace turns (1+)";
+        : result === "maxTreeLevels"
+          ? "Max tree levels (1-16, includes main agent)"
+          : result === "defaultMaxTurns"
+            ? "Default max turns (0 = unlimited)"
+            : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.

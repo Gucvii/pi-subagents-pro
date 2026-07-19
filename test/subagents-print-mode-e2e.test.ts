@@ -49,7 +49,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       prompt: "Delegate the greeting to a subagent.",
       respond: routeBySession({
         parentInitial: agentCall({
-          subagent_type: "general-purpose",
+          subagent_type: "general-purpose", model: "faux/faux-1", thinking: "off",
           description: "greet",
           prompt: "Say hello.",
           run_in_background: false,
@@ -82,6 +82,50 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     expect(run.modelCalls).toBeGreaterThanOrEqual(3);
   });
 
+  it("allows one nested delegation level and withholds Agent from level 3", async () => {
+    let grandchildSawAgentTool: boolean | undefined;
+    const seenAgentTrees: string[] = [];
+    const hasAgentResult = (ctx: Context) => ctx.messages.some(
+      (message) => message.role === "toolResult" && (message as { toolName?: string }).toolName === "Agent",
+    );
+    const resultText = (ctx: Context) => [...ctx.messages]
+      .reverse()
+      .filter((message) => message.role === "toolResult")
+      .flatMap((message) => (message.content ?? []) as Array<{ text?: string }>)
+      .map((block) => block.text ?? "")
+      .join("\n");
+
+    run = await runPrintMode({
+      prompt: "Create a child that delegates once more.",
+      respond: (ctx) => {
+        const systemPrompt = ctx.systemPrompt ?? "";
+        seenAgentTrees.push(systemPrompt.match(/<agent_tree[^>]*>/)?.[0] ?? "root");
+        if (systemPrompt.includes('level="3"')) {
+          grandchildSawAgentTool = (ctx.tools ?? []).some((tool) => tool.name === "Agent");
+          return "GRANDCHILD_OK";
+        }
+        if (systemPrompt.includes('level="2"')) {
+          return hasAgentResult(ctx)
+            ? `CHILD_RELAY_${resultText(ctx).includes("GRANDCHILD_OK") ? "OK" : "MISSING"}`
+            : agentCall({ prompt: "Return GRANDCHILD_OK.", run_in_background: false });
+        }
+        return hasAgentResult(ctx)
+          ? `ROOT_RELAY_${resultText(ctx).includes("CHILD_RELAY_OK") ? "OK" : "MISSING"}`
+          : agentCall({ prompt: "Delegate once, then relay the result.", run_in_background: false });
+      },
+    });
+
+    const parentToolResult = run.parentSession.messages.find(
+      (message) => message.role === "toolResult" && (message as any).toolName === "Agent",
+    ) as any;
+    const childRecord = run.manager?.getRecord(parentToolResult?.details?.agentId) as any;
+    expect(childRecord.session.getActiveToolNames()).toContain("Agent");
+    expect(agentToolResults(run.parentSession)).toEqual([expect.stringContaining("CHILD_RELAY_OK")]);
+    expect(run.responseText).toContain("ROOT_RELAY_OK");
+    expect(grandchildSawAgentTool).toBe(false);
+    expect(run.modelCalls).toBeGreaterThanOrEqual(5);
+  });
+
   it("the hold condition is load-bearing: it keeps a BACKGROUND child alive (vs abandoned without it)", async () => {
     // The child takes a beat to "think" (a real delay in its faux turn). That
     // delay is what makes the contrast causal and deterministic:
@@ -92,7 +136,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     //     finishes → the child's own model turn actually runs (≥3 calls).
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
     const respond = async (ctx: Context) => {
-      const isParent = (ctx.tools ?? []).some((t) => t.name === "Agent");
+      const isParent = !(ctx.systemPrompt?.includes("<active_agent ") ?? false);
       if (!isParent) {
         await sleep(80); // child takes long enough that a non-held parent exits first
         return "CHILD_BG_RAN";
@@ -102,7 +146,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       );
       return spawned
         ? "summarized"
-        : agentCall({ description: "bg work", prompt: "Do background work.", run_in_background: true });
+        : agentCall({ prompt: "Do background work.", run_in_background: true });
     };
 
     // Control: no hold → the child hasn't run by the time the parent turn ends.
@@ -116,8 +160,11 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
     // Subject: hold on → child runs to completion before the parent finishes.
     run = await runPrintMode({ prompt: "go", hold: true, respond });
 
-    // Background spawn returns its envelope synchronously either way.
-    expect(agentToolResults(run.parentSession)[0]).toMatch(/background/i);
+    // Background spawn succeeds with description/model/thinking omitted: the
+    // description is derived and execution identity inherits from the parent.
+    const backgroundResult = agentToolResults(run.parentSession)[0];
+    expect(backgroundResult).toMatch(/background/i);
+    expect(backgroundResult).toContain("Description: Do background work.");
     // The hold is load-bearing: only with it does the child's turn actually run.
     expect(abandonedCalls).toBe(2); // parent tool-call + summary; child never streamed
     expect(run.modelCalls).toBeGreaterThan(abandonedCalls);
@@ -143,7 +190,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       cwd, // runner chdir's here so the extension discovers echo-spy.md
       respond: routeBySession({
         parentInitial: agentCall({
-          subagent_type: "echo-spy",
+          subagent_type: "echo-spy", model: "faux/faux-1", thinking: "off",
           description: "echo",
           prompt: "Report what you were told.",
           run_in_background: false,
@@ -178,7 +225,7 @@ describe.skipIf(LIVE)("subagents print-mode e2e (scripted faux, real pi-mono)", 
       cwd,
       respond: routeBySession({
         parentInitial: agentCall({
-          subagent_type: "agents-spy",
+          subagent_type: "agents-spy", model: "faux/faux-1", thinking: "off",
           description: "echo workspace",
           prompt: "Report what you were told.",
           run_in_background: false,

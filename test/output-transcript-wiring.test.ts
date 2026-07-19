@@ -45,8 +45,13 @@ function makeCtx(cwd: string) {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd,
-    model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    model: { provider: "test", id: "model", name: "Test Model" },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAvailable: vi.fn(() => [{ provider: "test", id: "model", name: "Test Model" }]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "session-1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -97,7 +102,7 @@ describe("output_transcript agent wiring", () => {
 
     await tools.get("Agent").execute(
       "tool-call",
-      { prompt: "process sensitive data", description: "Process sensitive data", subagent_type: "sensitive" },
+      { prompt: "process sensitive data", description: "Process sensitive data", subagent_type: "sensitive", model: "test/model", thinking: "off" },
       undefined,
       undefined,
       makeCtx(cwd),
@@ -116,7 +121,7 @@ describe("output_transcript agent wiring", () => {
 
     await tools.get("Agent").execute(
       "tool-call",
-      { prompt: "process sensitive data", description: "Process sensitive data", subagent_type: "sensitive" },
+      { prompt: "process sensitive data", description: "Process sensitive data", subagent_type: "sensitive", model: "test/model", thinking: "off" },
       undefined,
       undefined,
       makeCtx(cwd),
@@ -134,7 +139,7 @@ describe("output_transcript agent wiring", () => {
 
     await tools.get("Agent").execute(
       "tool-call",
-      { prompt: "ordinary work", description: "Do ordinary work", subagent_type: "general-purpose" },
+      { prompt: "ordinary work", description: "Do ordinary work", subagent_type: "general-purpose", model: "test/model", thinking: "off" },
       undefined,
       undefined,
       makeCtx(cwd),
@@ -154,7 +159,7 @@ describe("output_transcript agent wiring", () => {
 
     await tools.get("Agent").execute(
       "tool-call",
-      { prompt: "ordinary work", description: "Do ordinary work", subagent_type: "general-purpose" },
+      { prompt: "ordinary work", description: "Do ordinary work", subagent_type: "general-purpose", model: "test/model", thinking: "off" },
       undefined,
       undefined,
       makeCtx(cwd),
@@ -174,7 +179,7 @@ describe("output_transcript agent wiring", () => {
 
     await tools.get("Agent").execute(
       "tool-call",
-      { prompt: "audited work", description: "Do audited work", subagent_type: "audited" },
+      { prompt: "audited work", description: "Do audited work", subagent_type: "audited", model: "test/model", thinking: "off" },
       undefined,
       undefined,
       makeCtx(cwd),

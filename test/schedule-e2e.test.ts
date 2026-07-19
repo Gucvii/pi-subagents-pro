@@ -52,7 +52,13 @@ function makePi() {
 function makeCtx() {
   return {
     cwd: "/tmp",
-    modelRegistry: { find: vi.fn(), getAll: () => [], getAvailable: () => [] },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAll: () => [{ provider: "test", id: "model", name: "Test Model" }],
+      getAvailable: () => [{ provider: "test", id: "model", name: "Test Model" }],
+    },
     sessionManager: { getSessionId: () => "sess-e2e" },
   } as any;
 }
@@ -96,7 +102,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
       name: "e2e-once",
       description: "test",
       schedule: future,
-      subagent_type: "general-purpose",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off",
       prompt: "hello",
     });
     expect(job.scheduleType).toBe("once");
@@ -123,7 +129,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
       name: "e2e-fail",
       description: "test",
       schedule: future,
-      subagent_type: "general-purpose",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off",
       prompt: "fail",
     });
 
@@ -144,7 +150,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
       name: "e2e-interval",
       description: "test",
       schedule: "100s",  // Will be too long; override below.
-      subagent_type: "general-purpose",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off",
       prompt: "tick",
     });
     // Replace with a literal 100ms interval — easier than crafting a parseable shorthand for ms.
@@ -171,7 +177,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
       name: "persistent",
       description: "x",
       schedule: future,
-      subagent_type: "general-purpose",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off",
       prompt: "x",
     });
 
@@ -192,7 +198,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
       name: "shape-test",
       description: "x",
       schedule: "1h",
-      subagent_type: "general-purpose",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off",
       prompt: "x",
     });
 
@@ -216,7 +222,7 @@ describe("SubagentScheduler — end-to-end with real timers", () => {
     const future = new Date(Date.now() + 100).toISOString();
     const job = scheduler.addJob({
       name: "events", description: "x", schedule: future,
-      subagent_type: "general-purpose", prompt: "x",
+      subagent_type: "general-purpose", model: "test/model", thinking: "off", prompt: "x",
     });
 
     await waitFor(() => manager.spawn.mock.calls.length === 1);

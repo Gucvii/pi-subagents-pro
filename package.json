@@ -1,16 +1,16 @@
 {
-  "name": "@tintinweb/pi-subagents",
-  "version": "0.14.2",
-  "description": "A pi extension extension that brings smart Claude Code-style autonomous sub-agents to pi.",
-  "author": "tintinweb",
+  "name": "@gucvii/pi-subagents-pro",
+  "version": "0.1.0",
+  "description": "Product-focused subagent harness for Pi with observable async execution.",
+  "author": "gucvii",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tintinweb/pi-subagents.git"
+    "url": "https://github.com/Gucvii/pi-subagents-pro.git"
   },
-  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "homepage": "https://github.com/Gucvii/pi-subagents-pro#readme",
   "bugs": {
-    "url": "https://github.com/tintinweb/pi-subagents/issues"
+    "url": "https://github.com/Gucvii/pi-subagents-pro/issues"
   },
   "keywords": [
     "pi-package",
@@ -49,8 +49,6 @@
   "pi": {
     "extensions": [
       "./src/index.ts"
-    ],
-    "video": "https://github.com/tintinweb/pi-subagents/raw/master/media/demo.mp4",
-    "image": "https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png"
+    ]
   }
 }

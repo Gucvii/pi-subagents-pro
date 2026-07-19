@@ -12,13 +12,15 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
-import type { AgentInvocation, AgentRecord, IsolationMode, SubagentType, ThinkingLevel } from "./types.js";
+import { createChildLineage, DEFAULT_MAX_TREE_LEVELS, normalizeMaxTreeLevels, resolveSessionLineage } from "./lineage.js";
+import type { AgentInvocation, AgentLineage, AgentRecord, IsolationMode, PersistedAgentRecord, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
 import { cleanupWorktree, createWorktree, pruneWorktrees, } from "./worktree.js";
 
 export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
+export type OnAgentChanged = (record: AgentRecord) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
 /** Default max concurrent background agents. */
@@ -51,6 +53,7 @@ interface SpawnArgs {
   ctx: ExtensionContext;
   type: SubagentType;
   prompt: string;
+  lineage: AgentLineage;
   options: SpawnOptions;
 }
 
@@ -97,13 +100,22 @@ interface SpawnOptions {
   onCompaction?: (info: CompactionInfo) => void;
 }
 
+interface ResumeRuntime {
+  pi: ExtensionAPI;
+  ctx: ExtensionContext;
+  model?: Model<any>;
+  thinkingLevel?: ThinkingLevel;
+}
+
 export class AgentManager {
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
+  private onChanged?: OnAgentChanged;
   private maxConcurrent: number;
+  private maxTreeLevels: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
    *  not just the parent repo (caller-supplied cwd can target other repos). */
   private worktreeRepos = new Set<string>();
@@ -118,14 +130,22 @@ export class AgentManager {
     maxConcurrent = DEFAULT_MAX_CONCURRENT,
     onStart?: OnAgentStart,
     onCompact?: OnAgentCompact,
+    maxTreeLevels = DEFAULT_MAX_TREE_LEVELS,
+    onChanged?: OnAgentChanged,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
+    this.onChanged = onChanged;
     this.maxConcurrent = maxConcurrent;
+    this.maxTreeLevels = normalizeMaxTreeLevels(maxTreeLevels);
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
     this.cleanupInterval = setInterval(() => this.cleanup(), 60_000);
     this.cleanupInterval.unref();
+  }
+
+  private notifyChanged(record: AgentRecord): void {
+    try { this.onChanged?.(record); } catch { /* persistence is best-effort at runtime */ }
   }
 
   /** Update the max concurrent background agents limit. */
@@ -137,6 +157,14 @@ export class AgentManager {
 
   getMaxConcurrent(): number {
     return this.maxConcurrent;
+  }
+
+  setMaxTreeLevels(levels: number): void {
+    this.maxTreeLevels = normalizeMaxTreeLevels(levels);
+  }
+
+  getMaxTreeLevels(): number {
+    return this.maxTreeLevels;
   }
 
   /**
@@ -155,7 +183,20 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
+    // Resolve lineage from trusted session metadata. Callers never provide depth,
+    // so Agent params, schedules, and RPC cannot reset themselves to the root.
+    const resolvedParentLineage = resolveSessionLineage(
+      ctx.sessionManager,
+      this.maxTreeLevels,
+      ctx.getSystemPrompt?.(),
+    );
+    // The main session starts each new tree with the current setting. Existing
+    // child trees keep their frozen maxTreeLevels for deterministic resumes.
+    const parentLineage = resolvedParentLineage.depth === 0
+      ? { ...resolvedParentLineage, maxTreeLevels: this.maxTreeLevels }
+      : resolvedParentLineage;
     const id = randomUUID().slice(0, 17);
+    const lineage = createChildLineage(parentLineage, id);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
@@ -164,6 +205,9 @@ export class AgentManager {
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
+      parentCwd: ctx.cwd,
+      parentSessionId: ctx.sessionManager?.getSessionId?.(),
+      parentSessionDir: ctx.sessionManager?.getSessionDir?.(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0 },
       compactionCount: 0,
@@ -173,15 +217,16 @@ export class AgentManager {
       // only filter excludes only explicit `false`, so undefined agents — which
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
+      lineage,
       invocation: options.invocation,
     };
     this.agents.set(id, record);
 
-    const args: SpawnArgs = { pi, ctx, type, prompt, options };
+    const args: SpawnArgs = { pi, ctx, type, prompt, lineage, options };
 
     if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
-      // Queue it — will be started when a running agent completes
       this.queue.push({ id, args });
+      this.notifyChanged(record);
       return id;
     }
 
@@ -197,7 +242,7 @@ export class AgentManager {
   }
 
   /** Actually start an agent (called immediately or from queue drain). */
-  private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, options }: SpawnArgs) {
+  private startAgent(id: string, record: AgentRecord, { pi, ctx, type, prompt, lineage, options }: SpawnArgs) {
     // Re-validate a caller-supplied cwd: queued spawns can start minutes after
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
@@ -232,7 +277,11 @@ export class AgentManager {
 
     record.status = "running";
     record.startedAt = Date.now();
+    record.sessionCwd = worktreeCwd ?? customCwd ?? ctx.cwd;
+    record.workspaceBaseCwd = baseCwd;
+    record.configCwd = customCwd !== undefined ? ctx.cwd : undefined;
     if (options.isBackground) this.runningBackground++;
+    this.notifyChanged(record);
     this.onStart?.(record);
 
     // Wire parent abort signal to stop the subagent when the parent is interrupted
@@ -246,6 +295,7 @@ export class AgentManager {
 
     const promise = runAgent(ctx, type, prompt, {
       pi,
+      lineage,
       agentId: id,
       model: options.model,
       maxTurns: options.maxTurns,
@@ -277,6 +327,9 @@ export class AgentManager {
       },
       onSessionCreated: (session) => {
         record.session = session;
+        record.sessionFile = session.sessionFile;
+        record.sessionCwd = session.sessionManager?.getCwd?.() ?? record.sessionCwd;
+        this.notifyChanged(record);
         // Flush any steers that arrived before the session was ready
         if (record.pendingSteers?.length) {
           for (const msg of record.pendingSteers) {
@@ -325,15 +378,20 @@ export class AgentManager {
             record.result = (record.result ?? "") +
               `\n\n---\nChanges saved to branch \`${wtResult.branch}\`${repoNote}. Merge with: \`git merge ${wtResult.branch}\`${customCwd !== undefined ? ` (run in \`${baseCwd}\`)` : ""}`;
           }
+          record.session?.dispose();
+          record.session = undefined;
+          record.sessionCwd = baseCwd;
         }
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
         if (!options.isBackground) {
           record.resultConsumed = true;
+          this.notifyChanged(record);
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
         } else {
           this.runningBackground--;
+          this.notifyChanged(record);
           try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
           this.drainQueue();
         }
@@ -361,15 +419,20 @@ export class AgentManager {
             const wtResult = cleanupWorktree(baseCwd, record.worktree, options.description);
             record.worktreeResult = wtResult;
           } catch { /* ignore cleanup errors */ }
+          record.session?.dispose();
+          record.session = undefined;
+          record.sessionCwd = baseCwd;
         }
 
         // Fire onComplete for foreground agents too — lifecycle symmetry.
         // Mark resultConsumed so the callback skips notifications (result returned inline).
         if (!options.isBackground) {
           record.resultConsumed = true;
+          this.notifyChanged(record);
           this.onComplete?.(record);
         } else {
           this.runningBackground--;
+          this.notifyChanged(record);
           this.onComplete?.(record);
           this.drainQueue();
         }
@@ -398,6 +461,7 @@ export class AgentManager {
         record.status = "error";
         record.error = err instanceof Error ? err.message : String(err);
         record.completedAt = Date.now();
+        this.notifyChanged(record);
         this.onComplete?.(record);
       }
     }
@@ -439,39 +503,123 @@ export class AgentManager {
     }
   }
 
-  /**
-   * Resume an existing agent session with a new prompt.
-   */
+  /** Rehydrate durable Agent IDs without eagerly opening every child session. */
+  restorePersisted(records: PersistedAgentRecord[]): number {
+    let restored = 0;
+    for (const persisted of records) {
+      if (this.agents.has(persisted.id)) continue;
+      const interrupted = persisted.status === "running" || persisted.status === "queued";
+      const record: AgentRecord = {
+        ...persisted,
+        status: interrupted ? "stopped" : persisted.status,
+        error: interrupted
+          ? "The previous Pi process exited before this Agent completed. Resume to continue."
+          : persisted.error,
+        lifetimeUsage: { ...persisted.lifetimeUsage },
+        lineage: { ...persisted.lineage },
+        invocation: persisted.invocation ? { ...persisted.invocation } : undefined,
+      };
+      this.agents.set(record.id, record);
+      this.notifyChanged(record);
+      restored++;
+    }
+    return restored;
+  }
+
+  /** Resume a live session, or lazily reopen its durable Pi session after restart. */
   async resume(
     id: string,
     prompt: string,
     signal?: AbortSignal,
+    runtime?: ResumeRuntime,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    if (!record || (!record.session && (!record.sessionFile || !runtime))) return undefined;
 
     record.status = "running";
     record.startedAt = Date.now();
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    record.resultConsumed = true;
+    this.notifyChanged(record);
+    this.onStart?.(record);
 
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
-        onToolActivity: (activity) => {
-          if (activity.type === "end") record.toolUses++;
-        },
-        onAssistantUsage: (usage) => {
-          addUsage(record.lifetimeUsage, usage);
-        },
-        onCompaction: (info) => {
-          record.compactionCount++;
-          this.onCompact?.(record, info);
-        },
-        signal,
-      });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
+      let text = "";
+      let failure: string | undefined;
+      if (record.session) {
+        const resumed = await resumeAgent(record.session, prompt, {
+          onToolActivity: (activity) => {
+            if (activity.type === "end") record.toolUses++;
+          },
+          onAssistantUsage: (usage) => addUsage(record.lifetimeUsage, usage),
+          onCompaction: (info) => {
+            record.compactionCount++;
+            this.onCompact?.(record, info);
+          },
+          signal,
+        });
+        text = resumed.text;
+        failure = resumed.failure;
+      } else {
+        const isolation = record.invocation?.isolation;
+        const baseCwd = record.workspaceBaseCwd ?? runtime!.ctx.cwd;
+        const resumeWorktree = isolation === "worktree"
+          ? createWorktree(baseCwd, `${record.id}-resume-${Date.now()}`)
+          : undefined;
+        if (isolation === "worktree" && !resumeWorktree) {
+          throw new Error('Cannot restore isolation: "worktree" — the base repository is unavailable.');
+        }
+        const resumeCwd = resumeWorktree
+          ? (record.configCwd ? resumeWorktree.workPath : resumeWorktree.path)
+          : record.sessionCwd;
+
+        try {
+          const reopened = await runAgent(runtime!.ctx, record.type, prompt, {
+            pi: runtime!.pi,
+            agentId: record.id,
+            lineage: record.lineage,
+            resumeSessionFile: record.sessionFile,
+            cwd: resumeCwd,
+            configCwd: record.configCwd,
+            model: runtime!.model,
+            thinkingLevel: runtime!.thinkingLevel,
+            maxTurns: record.invocation?.maxTurns,
+            isolated: record.invocation?.isolated,
+            signal,
+            onToolActivity: (activity) => {
+              if (activity.type === "end") record.toolUses++;
+            },
+            onAssistantUsage: (usage) => addUsage(record.lifetimeUsage, usage),
+            onCompaction: (info) => {
+              record.compactionCount++;
+              this.onCompact?.(record, info);
+            },
+            onSessionCreated: (session) => {
+              record.session = session;
+              record.sessionFile = session.sessionFile;
+              record.sessionCwd = session.sessionManager?.getCwd?.() ?? resumeCwd;
+              this.notifyChanged(record);
+            },
+          });
+          record.session = reopened.session;
+          text = reopened.responseText;
+          failure = reopened.failure;
+        } finally {
+          if (resumeWorktree) {
+            const worktreeResult = cleanupWorktree(baseCwd, resumeWorktree, record.description);
+            record.worktreeResult = worktreeResult;
+            record.sessionCwd = baseCwd;
+            record.session?.dispose();
+            record.session = undefined;
+            if (worktreeResult.hasChanges && worktreeResult.branch) {
+              text = (text ?? "") + `\n\n---\nChanges saved to branch \`${worktreeResult.branch}\`. Merge with: \`git merge ${worktreeResult.branch}\``;
+            }
+          }
+        }
+      }
+
       record.status = failure ? "error" : "completed";
       if (failure) record.error = failure;
       record.result = text;
@@ -482,6 +630,8 @@ export class AgentManager {
       record.completedAt = Date.now();
     }
 
+    this.notifyChanged(record);
+    try { this.onComplete?.(record); } catch { /* completion side effects are isolated */ }
     return record;
   }
 
@@ -525,6 +675,7 @@ export class AgentManager {
       this.queue = this.queue.filter(q => q.id !== id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      this.notifyChanged(record);
       return true;
     }
 
@@ -532,6 +683,7 @@ export class AgentManager {
     record.abortController?.abort();
     record.status = "stopped";
     record.completedAt = Date.now();
+    this.notifyChanged(record);
     return true;
   }
 
@@ -581,6 +733,7 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.notifyChanged(record);
         count++;
       }
     }
@@ -591,6 +744,7 @@ export class AgentManager {
         record.abortController?.abort();
         record.status = "stopped";
         record.completedAt = Date.now();
+        this.notifyChanged(record);
         count++;
       }
     }

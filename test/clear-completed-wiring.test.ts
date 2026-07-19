@@ -52,8 +52,13 @@ function ctx() {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
-    model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    model: { provider: "test", id: "model", name: "Test Model" },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAvailable: vi.fn(() => [{ provider: "test", id: "model", name: "Test Model" }]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -77,7 +82,7 @@ async function spawnCompletedBackgroundAgent(tools: Map<string, any>): Promise<s
   });
   const spawn = await tools.get("Agent").execute(
     "tc-spawn",
-    { prompt: "go", description: "Review monero_en.rs in depth", subagent_type: "general-purpose", run_in_background: true },
+    { prompt: "go", description: "Review monero_en.rs in depth", subagent_type: "general-purpose", model: "test/model", thinking: "off", run_in_background: true },
     undefined,
     undefined,
     ctx(),

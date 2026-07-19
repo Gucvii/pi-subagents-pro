@@ -230,7 +230,7 @@ describe("FleetList navigation", () => {
       fleet.setEnabled(false); // hides, clears the timer
       fleet.setEnabled(true);  // re-shows — must re-arm the timer
       const before = listAgents.mock.calls.length;
-      vi.advanceTimersByTime(250); // a tick should fire and re-read the roster
+      vi.advanceTimersByTime(1000); // a tick should fire and re-read the roster
       expect(listAgents.mock.calls.length).toBeGreaterThan(before);
       fleet.dispose();
     } finally {
@@ -292,15 +292,19 @@ describe("FleetList vs other focused components (#123)", () => {
 });
 
 describe("FleetList rendering", () => {
-  it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
-    const h = harness([makeRecord({ description: "Sleep then report 1" })]);
-    const lines = h.render(120);
+  it("renders main + agent rows with model, effort, description and right-aligned stats", () => {
+    const h = harness([makeRecord({
+      description: "Sleep then report 1",
+      invocation: { modelName: "opencode-go/deepseek-v4-flash", thinking: "max" },
+    })]);
+    const lines = h.render(200);
     // hint + blank + main + one agent
     expect(lines[0]).toContain("← for agents");
     expect(lines.find(l => l.includes("main"))).toContain("⏺"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("◯");
     expect(agentLine).toContain(getDisplayName("general-purpose"));
+    expect(agentLine).toContain("deepseek-v4-flash · effort max");
     expect(agentLine).toContain("↓ 13.1k tokens");
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });

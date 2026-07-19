@@ -4,7 +4,8 @@
 
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
@@ -21,14 +22,15 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getConfig, getMemoryToolNames, getR
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { appendLineageEntry, canSpawnChild } from "./lineage.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { AgentLineage, SubagentType, ThinkingLevel } from "./types.js";
 
 /**
  * Tool names registered by THIS extension. Single source of truth so the
- * registration sites (index.ts) and the subagent exclusion list below can't
+ * registration sites (index.ts) and the lineage-gated tool set below can't
  * drift apart. These are our own tools, not pi built-ins, so they can't be
  * derived from pi — but they only need defining once.
  */
@@ -38,8 +40,10 @@ export const SUBAGENT_TOOL_NAMES = {
   STEER: "steer_subagent",
 } as const;
 
-/** Names of tools registered by this extension that subagents must NOT inherit. */
+/** Tools withheld from legacy or maximum-level child sessions. */
 const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+const THIS_MODULE_PATH = fileURLToPath(import.meta.url);
+const SELF_EXTENSION_PATH = join(dirname(THIS_MODULE_PATH), `index${extname(THIS_MODULE_PATH)}`);
 
 /**
  * Canonical name of an extension for `extensions: [...]` allowlist matching.
@@ -261,6 +265,10 @@ export interface RunOptions {
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
+  /** Trusted manager-assigned tree position. Omitted only by legacy/direct callers. */
+  lineage?: AgentLineage;
+  /** Existing durable Pi session opened lazily for cross-process resume. */
+  resumeSessionFile?: string;
   model?: Model<any>;
   maxTurns?: number;
   signal?: AbortSignal;
@@ -428,7 +436,8 @@ export async function runAgent(
 
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
-
+  if (options.lineage) extras.agentTree = options.lineage;
+  const allowSubagentTools = options.lineage ? canSpawnChild(options.lineage) : false;
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
   // Nulling excludes under isolated also suppresses the orphaned-exclude warning —
@@ -521,7 +530,17 @@ export async function runAgent(
   // It's only needed when we're neither loading everything without excludes
   // (`extensions: true` or a `"*"` wildcard) nor nothing (`noExtensions`).
   const loadAll = extensions === true || extensionsSpec?.wildcard === true;
-  const additionalExtensionPaths = extensionsSpec?.paths.length ? extensionsSpec.paths : undefined;
+  // A parent may itself have been loaded via `pi -e path` rather than installed
+  // in settings. Explicitly carry this extension into delegating child sessions
+  // so an advertised Agent tool always has a bound implementation.
+  const carrySelfExtension = allowSubagentTools
+    && loadAll
+    && !extensionCanonicalNames(SELF_EXTENSION_PATH).some((name) => excludeNames.has(name));
+  const additionalExtensionPathsList = [
+    ...(extensionsSpec?.paths ?? []),
+    ...(carrySelfExtension ? [SELF_EXTENSION_PATH] : []),
+  ];
+  const additionalExtensionPaths = additionalExtensionPathsList.length > 0 ? additionalExtensionPathsList : undefined;
   // Pre-filter discovered set, captured by the override — the exclude-typo warning
   // must compare against this, not the surviving set (absence from survivors is
   // an exclude *succeeding*).
@@ -660,13 +679,12 @@ export async function runAgent(
     }
   }
 
-  // Build the master tool allowlist applied at session construction.
-  // pi-mono's `allowedToolNames` gates BOTH registration and the initial active
-  // set, so listing the exact final set here means the session is correctly
-  // scoped from the first instant — no post-construction narrowing required.
+  // Nested delegation is opt-in through trusted lineage. Legacy/direct runner
+  // callers remain non-recursive; a maximum-level child does not even see this
+  // extension's tools. AgentManager independently rejects over-depth spawns.
   const builtinToolNameSet = new Set(toolNames);
   const allowedTools = [...toolNames, ...extensionToolNames].filter((t) => {
-    if (EXCLUDED_TOOL_NAMES.includes(t)) return false;
+    if (EXCLUDED_TOOL_NAMES.includes(t) && !allowSubagentTools) return false;
     if (disallowedSet?.has(t)) return false;
     if (builtinToolNameSet.has(t)) return true;
     // Reached only for extension tools. The extension set was already filtered
@@ -678,10 +696,12 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
-  const sessionManager = agentConfig?.persistSession
-    ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
-    : SessionManager.inMemory(effectiveCwd);
-
+  const sessionManager = options.resumeSessionFile
+    ? SessionManager.open(options.resumeSessionFile, undefined, effectiveCwd)
+    : agentConfig?.persistSession !== false
+      ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
+      : SessionManager.inMemory(effectiveCwd);
+  if (options.lineage) appendLineageEntry(sessionManager, options.lineage);
   // Pi 0.80.8 replaced createAgentSession's modelRegistry option with
   // modelRuntime, but ExtensionContext still exposes only the registry facade.
   // Pass both so the full supported Pi range retains the parent's providers.

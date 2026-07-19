@@ -19,7 +19,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Cron } from "croner";
 import { nanoid } from "nanoid";
 import type { AgentManager } from "./agent-manager.js";
-import { resolveModel } from "./model-resolver.js";
+import { resolveExactModel } from "./model-resolver.js";
 import type { ScheduleStore } from "./schedule-store.js";
 import type { IsolationMode, ScheduledSubagent, SubagentType, ThinkingLevel } from "./types.js";
 
@@ -38,8 +38,8 @@ export interface NewJobInput {
   schedule: string;
   subagent_type: SubagentType;
   prompt: string;
-  model?: string;
-  thinking?: ThinkingLevel;
+  model: string;
+  thinking: ThinkingLevel;
   max_turns?: number;
   isolated?: boolean;
   isolation?: IsolationMode;
@@ -227,13 +227,19 @@ export class SubagentScheduler {
 
     store.update(id, { lastStatus: "running" });
 
-    // Resolve model at fire time — registry contents may have changed since the
-    // job was created (auth added/removed). Fall back silently to spawn-default
-    // if resolution fails; the spawn path handles undefined model gracefully.
-    let resolvedModel: any | undefined;
-    if (job.model) {
-      const r = resolveModel(job.model, ctx.modelRegistry);
-      if (typeof r !== "string") resolvedModel = r;
+    // Scheduled runs must retain an exact execution identity. Never silently
+    // inherit or fuzzy-fallback when auth/model catalogs change.
+    if (!job.model || !job.thinking) {
+      const error = "Scheduled agent is missing required model or thinking identity";
+      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      this.emit({ type: "error", jobId: id, error });
+      return;
+    }
+    const resolvedModel = resolveExactModel(job.model, ctx.modelRegistry);
+    if (typeof resolvedModel === "string") {
+      store.update(id, { lastRun: new Date().toISOString(), lastStatus: "error" });
+      this.emit({ type: "error", jobId: id, error: resolvedModel });
+      return;
     }
 
     let agentId: string;
@@ -247,6 +253,14 @@ export class SubagentScheduler {
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        invocation: {
+          modelName: job.model,
+          thinking: job.thinking,
+          maxTurns: job.max_turns,
+          isolated: job.isolated,
+          runInBackground: true,
+          isolation: job.isolation,
+        },
       });
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);

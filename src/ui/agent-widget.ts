@@ -15,6 +15,8 @@ import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type Se
 
 /** Maximum number of rendered lines before overflow collapse kicks in. */
 const MAX_WIDGET_LINES = 12;
+/** Terminal animations above 4 FPS cause full-screen churn with rich tool renderers. */
+const WIDGET_TICK_MS = 250;
 
 /** Braille spinner frames for animated running indicator. */
 export const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -76,7 +78,7 @@ export interface AgentDetails {
   activity?: string;
   /** Current spinner frame index (for animated running indicator). */
   spinnerFrame?: number;
-  /** Short model name if different from parent (e.g. "haiku", "sonnet"). */
+  /** Exact effective provider/model identifier used by the child. */
   modelName?: string;
   /** Notable config tags (e.g. ["thinking: high", "isolated"]). */
   tags?: string[];
@@ -158,6 +160,21 @@ export function getDisplayName(type: SubagentType): string {
 export function getPromptModeLabel(type: SubagentType): string | undefined {
   const config = getConfig(type);
   return config.promptMode === "append" ? "twin" : undefined;
+}
+
+/** Primary execution identity for compact status surfaces. */
+export function formatInvocationIdentity(
+  invocation: AgentInvocation | undefined,
+  compactModel = false,
+): string | undefined {
+  if (!invocation) return undefined;
+  const model = invocation.modelName
+    ? compactModel
+      ? (invocation.modelName.split("/").pop() ?? invocation.modelName)
+      : invocation.modelName
+    : undefined;
+  const parts = [model, invocation.thinking ? `effort ${invocation.thinking}` : undefined].filter(Boolean);
+  return parts.length > 0 ? parts.join(" · ") : undefined;
 }
 
 /** Mode label is not included — callers add it where they want it. */
@@ -287,7 +304,7 @@ export class AgentWidget {
   /** Ensure the widget update timer is running. */
   ensureTimer() {
     if (!this.widgetInterval) {
-      this.widgetInterval = setInterval(() => this.update(), 80);
+      this.widgetInterval = setInterval(() => this.update(), WIDGET_TICK_MS);
     }
   }
 
@@ -306,7 +323,7 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string }, theme: Theme): string {
+  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; invocation?: AgentInvocation }, theme: Theme): string {
     const name = getDisplayName(a.type);
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
@@ -333,6 +350,8 @@ export class AgentWidget {
     }
 
     const parts: string[] = [];
+    const identity = formatInvocationIdentity(a.invocation, true);
+    if (identity) parts.push(identity);
     const activity = this.agentActivity.get(a.id);
     if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
@@ -389,6 +408,8 @@ export class AgentWidget {
       const tokenText = tokens > 0 ? formatSessionTokens(tokens, contextPercent, theme, a.compactionCount) : "";
 
       const parts: string[] = [];
+      const identity = formatInvocationIdentity(a.invocation, true);
+      if (identity) parts.push(identity);
       if (bg) parts.push(formatTurns(bg.turnCount, bg.maxTurns));
       if (toolUses > 0) parts.push(`${toolUses} tool use${toolUses === 1 ? "" : "s"}`);
       if (tokenText) parts.push(tokenText);

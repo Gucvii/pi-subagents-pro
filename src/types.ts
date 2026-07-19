@@ -2,7 +2,7 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { ModelThinkingLevel as ThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import type { LifetimeUsage } from "./usage.js";
 
@@ -41,7 +41,7 @@ export interface AgentConfig {
   model?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;
-  /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
+  /** Durable Pi session by default; false explicitly opts this agent into memory-only execution. */
   persistSession?: boolean;
   /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
   outputTranscript?: boolean;
@@ -78,6 +78,20 @@ export type JoinMode = 'async' | 'group' | 'smart';
  */
 export type WidgetMode = 'all' | 'background' | 'off';
 
+/** Immutable position of a session in one main-agent/subagent tree. */
+export interface AgentLineage {
+  /** Current main/subagent identity. The main session id is used at depth 0. */
+  agentId: string;
+  /** Immediate spawning agent; absent only for the main agent. */
+  parentAgentId?: string;
+  /** Main-session identity shared by the whole tree. */
+  rootAgentId: string;
+  /** Zero-based edge depth: main = 0, direct child = 1. */
+  depth: number;
+  /** User-facing total tree levels, including the main agent as level 1. */
+  maxTreeLevels: number;
+}
+
 export interface AgentRecord {
   id: string;
   type: SubagentType;
@@ -89,6 +103,18 @@ export interface AgentRecord {
   startedAt: number;
   completedAt?: number;
   session?: AgentSession;
+  /** Parent Pi session that owns this Agent ID and durable index entry. */
+  parentCwd?: string;
+  parentSessionId?: string;
+  parentSessionDir?: string;
+  /** Stable repository/cwd used to recreate worktree isolation on resume. */
+  workspaceBaseCwd?: string;
+  /** Durable Pi session file used for lazy cross-process resume. */
+  sessionFile?: string;
+  /** Child working directory recorded with the durable session. */
+  sessionCwd?: string;
+  /** Project config root used when the child worked in another cwd. */
+  configCwd?: string;
   abortController?: AbortController;
   promise?: Promise<string>;
   groupId?: string;
@@ -126,12 +152,46 @@ export interface AgentRecord {
    * which only the Agent-tool path populates.
    */
   isBackground?: boolean;
+  /** Immutable parent/root/depth metadata assigned by AgentManager. */
+  lineage: AgentLineage;
   /** Resolved spawn params, captured for UI display. Fixed at spawn time. */
   invocation?: AgentInvocation;
 }
 
+/** JSON-safe AgentRecord projection stored beside the parent Pi session. */
+export interface PersistedAgentRecord {
+  id: string;
+  type: SubagentType;
+  description: string;
+  status: AgentRecord["status"];
+  result?: string;
+  error?: string;
+  toolUses: number;
+  startedAt: number;
+  completedAt?: number;
+  parentCwd?: string;
+  parentSessionId?: string;
+  parentSessionDir?: string;
+  workspaceBaseCwd?: string;
+  sessionFile?: string;
+  sessionCwd?: string;
+  configCwd?: string;
+  groupId?: string;
+  joinMode?: JoinMode;
+  resultConsumed?: boolean;
+  lifetimeUsage: LifetimeUsage;
+  compactionCount: number;
+  isBackground?: boolean;
+  lineage: AgentLineage;
+  invocation?: AgentInvocation;
+}
+
+export interface AgentSessionStoreData {
+  version: 1;
+  agents: PersistedAgentRecord[];
+}
 export interface AgentInvocation {
-  /** Short display name, e.g. "haiku" — only set when different from parent. */
+  /** Effective provider/model identifier used by the child. */
   modelName?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;
@@ -146,6 +206,10 @@ export interface NotificationDetails {
   id: string;
   description: string;
   status: string;
+  /** Effective provider/model identifier used by the child. */
+  modelName?: string;
+  /** Effective thinking level used by the child. */
+  thinking?: ThinkingLevel;
   toolUses: number;
   turnCount: number;
   maxTurns?: number;
@@ -184,7 +248,9 @@ export interface ScheduledSubagent {
   // spawn params (subset of Agent tool params; no inherit_context, no resume)
   subagent_type: SubagentType;
   prompt: string;
+  /** Optional only for loading legacy persisted schedules; new jobs require it. */
   model?: string;
+  /** Optional only for loading legacy persisted schedules; new jobs require it. */
   thinking?: ThinkingLevel;
   max_turns?: number;
   isolated?: boolean;

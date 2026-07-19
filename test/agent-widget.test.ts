@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { renderRunningAgentStatus } from "../src/index.js";
+import { deriveAgentDescription, formatPromptPreview, renderAgentCallCard, renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatSessionTokens } from "../src/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatInvocationIdentity, formatSessionTokens } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -39,6 +39,46 @@ describe("formatSessionTokens", () => {
     expect(fgPreservingNestedStyles(ansiTheme, "accent", tokenText)).toBe(
       "\u001b[35m1.2k token (\u001b[33m70%\u001b[39m\u001b[35m)\u001b[39m",
     );
+  });
+});
+
+describe("agent invocation presentation", () => {
+  const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  it("renders prompt, model, effort, context, and background mode before launch", () => {
+    const component = renderAgentCallCard({
+      displayName: "Reviewer",
+      description: "复核旧插件缺陷",
+      prompt: "Read the implementation and report only verified issues.",
+      model: "opencode-go/deepseek-v4-flash",
+      thinking: "max",
+      runInBackground: true,
+      inheritContext: false,
+    }, theme);
+
+    expect(component.render(200).map(line => line.trimEnd())).toEqual([
+      "◆ Reviewer  复核旧插件缺陷  BACKGROUND",
+      "  opencode-go/deepseek-v4-flash · effort max · fresh context",
+      "  └─ prompt Read the implementation and report only verified issues.",
+    ]);
+  });
+
+  it("normalizes and truncates prompt previews", () => {
+    expect(formatPromptPreview(" first\n\n second ")).toBe("first second");
+    expect(formatPromptPreview("123456", 5)).toBe("1234…");
+  });
+
+  it("derives optional descriptions from the prompt", () => {
+    expect(deriveAgentDescription("  Review auth. Then report. ")).toBe("Review auth.");
+    expect(deriveAgentDescription("", 10)).toBe("Subagent task");
+    expect(deriveAgentDescription("123456", 5)).toBe("1234…");
+  });
+
+  it("formats compact model and effort identity", () => {
+    expect(formatInvocationIdentity({
+      modelName: "opencode-go/deepseek-v4-flash",
+      thinking: "max",
+    }, true)).toBe("deepseek-v4-flash · effort max");
   });
 });
 
@@ -115,11 +155,16 @@ describe("AgentWidget", () => {
   // Also covers scheduler-spawned agents (isBackground=true, no `invocation`
   // snapshot): if the filter still keyed off `invocation.runInBackground` —
   // #118's original approach — this would wrongly vanish.
-  it("renders background agents in 'background' mode", () => {
-    const manager = { listAgents: () => [makeRecord("background", { isBackground: true })] };
+  it("renders background agents in 'background' mode with model and effort", () => {
+    const record = {
+      ...makeRecord("background", { isBackground: true }),
+      invocation: { modelName: "opencode-go/deepseek-v4-flash", thinking: "max" },
+    };
+    const manager = { listAgents: () => [record] };
     const lines = renderLines(manager, "background", () => "background");
     expect(lines).toContain("Agents");
     expect(lines).toContain("background description");
+    expect(lines).toContain("deepseek-v4-flash · effort max");
   });
 
   // 'background' excludes only agents *known* to be foreground; one with no

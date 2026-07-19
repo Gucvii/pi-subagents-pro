@@ -54,8 +54,13 @@ function ctxWith(ui: ReturnType<typeof uiCtx>) {
     hasUI: true,
     ui,
     cwd: process.cwd(),
-    model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    model: { provider: "test", id: "model", name: "Test Model" },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAvailable: vi.fn(() => [{ provider: "test", id: "model", name: "Test Model" }]),
+    },
     sessionManager: { getSessionId: () => "s1", getBranch: () => [] },
     getSystemPrompt: () => "parent",
   } as any;
@@ -124,7 +129,7 @@ describe("FleetView wiring (real extension lifecycle)", () => {
 
     const spawn = await tools.get("Agent").execute(
       "tc",
-      { prompt: "go", description: "live one", subagent_type: "general-purpose", run_in_background: true },
+      { prompt: "go", description: "live one", subagent_type: "general-purpose", model: "test/model", thinking: "off", run_in_background: true },
       undefined,
       undefined,
       ctxWith(uiCtx()),

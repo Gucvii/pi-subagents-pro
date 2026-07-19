@@ -2,7 +2,7 @@
  * prompts.ts — System prompt builder for agents.
  */
 
-import type { AgentConfig, EnvInfo } from "./types.js";
+import type { AgentConfig, AgentLineage, EnvInfo } from "./types.js";
 
 /** Extra sections to inject into the system prompt (memory, skills, etc.). */
 export interface PromptExtras {
@@ -10,6 +10,8 @@ export interface PromptExtras {
   memoryBlock?: string;
   /** Preloaded skill contents to inject. */
   skillBlocks?: { name: string; content: string }[];
+  /** Current position and delegation allowance in the bounded Agent tree. */
+  agentTree?: AgentLineage;
 }
 
 /**
@@ -52,6 +54,18 @@ Platform: ${env.platform}`;
     for (const skill of extras.skillBlocks) {
       extraSections.push(`\n# Preloaded Skill: ${skill.name}\n${skill.content}`);
     }
+  }
+  if (extras?.agentTree) {
+    const lineage = extras.agentTree;
+    const level = lineage.depth + 1;
+    const canSpawnChild = lineage.depth + 1 < lineage.maxTreeLevels;
+    const encoded = (value: string | undefined) => encodeURIComponent(value ?? "");
+    extraSections.push(`<agent_tree level="${level}" max_levels="${lineage.maxTreeLevels}" depth="${lineage.depth}" agent_id="${encoded(lineage.agentId)}" parent_agent_id="${encoded(lineage.parentAgentId)}" root_agent_id="${encoded(lineage.rootAgentId)}">
+You are level ${level} of ${lineage.maxTreeLevels}, counting the main agent as level 1.
+${canSpawnChild
+  ? "You may delegate one level deeper when delegation is genuinely useful."
+  : "You are at the maximum level. You cannot create subagents; complete the task yourself or report back to your parent."}
+</agent_tree>`);
   }
   const extrasSuffix = extraSections.length > 0 ? "\n\n" + extraSections.join("\n") : "";
 

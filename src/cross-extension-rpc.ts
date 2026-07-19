@@ -9,7 +9,8 @@
  *   error   → { success: false, error: string }
  */
 
-import { type ModelRegistry, resolveModel } from "./model-resolver.js";
+import { type ModelRegistry, resolveExactModel } from "./model-resolver.js";
+import type { ThinkingLevel } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -23,7 +24,7 @@ export type RpcReply<T = void> =
   | { success: false; error: string };
 
 /** RPC protocol version — bumped when the envelope or method contracts change. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Minimal AgentManager interface needed by the spawn/stop RPCs. */
 export interface SpawnCapable {
@@ -84,31 +85,39 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       const ctx = getCtx();
       if (!ctx) throw new Error("No active session");
 
-      // Cross-extension RPC callers (e.g. pi-tasks TaskExecute) naturally
-      // forward serializable values, so options.model can be a string like
-      // "openai-codex/gpt-5.5". Resolve it to a real Model instance here
-      // — same pattern the scheduler path already uses — so the spawned
-      // agent's auth lookup doesn't crash with "No API key found for
-      // undefined".
-      let normalizedOptions = options ?? {};
-      if (typeof normalizedOptions.model === "string") {
-        const registry = (ctx as { modelRegistry?: ModelRegistry }).modelRegistry;
-        if (!registry) {
-          throw new Error(
-            `Model override "${normalizedOptions.model}" provided but ctx.modelRegistry is unavailable`,
-          );
-        }
-        const resolved = resolveModel(normalizedOptions.model, registry);
-        if (typeof resolved === "string") {
-          // resolveModel returns a human-readable error string when the
-          // input doesn't match any available model. Surface it instead of
-          // silently falling back so the caller sees the auth/typo issue.
-          throw new Error(resolved);
-        }
-        normalizedOptions = { ...normalizedOptions, model: resolved };
+      const normalizedOptions = options ?? {};
+      const registry = (ctx as { modelRegistry?: ModelRegistry }).modelRegistry;
+      if (!registry) throw new Error("ctx.modelRegistry is unavailable");
+      if (typeof normalizedOptions.model !== "string") {
+        throw new Error('RPC spawn requires model as an exact "provider/modelId" string');
+      }
+      const thinking = normalizedOptions.thinkingLevel as ThinkingLevel | undefined;
+      const allowedThinking = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+      if (!thinking || !allowedThinking.has(thinking)) {
+        throw new Error("RPC spawn requires an explicit valid thinkingLevel");
       }
 
-      return { id: manager.spawn(pi, ctx, type, prompt, normalizedOptions) };
+      const resolved = resolveExactModel(normalizedOptions.model, registry);
+      if (typeof resolved === "string") throw new Error(resolved);
+      const canonicalModelName = `${resolved.provider}/${resolved.id}`;
+      const invocation = {
+        modelName: canonicalModelName,
+        thinking,
+        maxTurns: normalizedOptions.maxTurns,
+        isolated: normalizedOptions.isolated,
+        inheritContext: normalizedOptions.inheritContext,
+        runInBackground: normalizedOptions.isBackground,
+        isolation: normalizedOptions.isolation,
+      };
+
+      return {
+        id: manager.spawn(pi, ctx, type, prompt, {
+          ...normalizedOptions,
+          model: resolved,
+          thinkingLevel: thinking,
+          invocation,
+        }),
+      };
     },
   );
 

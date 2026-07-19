@@ -9,6 +9,8 @@ import type { JoinMode, WidgetMode } from "./types.js";
 
 export interface SubagentsSettings {
   maxConcurrent?: number;
+  /** Total Agent-tree levels including the main agent as level 1. Defaults to 3. */
+  maxTreeLevels?: number;
   /**
    * 0 = unlimited — the extension's single source of truth for that convention:
    * `normalizeMaxTurns()` in agent-runner.ts treats 0 → `undefined`, and the
@@ -32,17 +34,9 @@ export interface SubagentsSettings {
    * (`<agentDir>/settings.json`) and project-local (`<cwd>/.pi/settings.json`),
    * with project overriding global (mirrors pi's SettingsManager deep-merge).
    *
-   * scopeModels guards against runtime LLM choices, not user-level config.
-   * Out-of-scope handling reflects this:
-   *   - Caller-supplied via `Agent({ model: "..." })` (only when frontmatter
-   *     has no `model:`, since frontmatter is authoritative): hard error
-   *     returned to the orchestrator, listing the allowed models. The LLM
-   *     made an explicit out-of-scope choice and gets explicit feedback.
-   *   - Frontmatter-pinned: warning toast + the pinned model runs. The
-   *     agent's author/installer chose this; trust it.
-   *   - Parent-inherited (neither caller nor frontmatter sets a model):
-   *     warning toast + parent's model runs. The user chose the parent's
-   *     model when starting the session; trust it.
+   * Every effective model is checked, whether it came from an explicit Agent
+   * call, an agent frontmatter pin, or main-agent inheritance. Violations are
+   * returned to the orchestrator as hard errors with the allowed model list.
    *
    * No-op when pi's `enabledModels` is empty or absent — nothing to validate
    * against. Defaults to false: subagents may use any model.
@@ -101,6 +95,7 @@ export type ToolDescriptionMode = "full" | "compact" | "custom";
 /** Setter hooks used by applySettings to wire persisted values into in-memory state. */
 export interface SettingsAppliers {
   setMaxConcurrent: (n: number) => void;
+  setMaxTreeLevels: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
@@ -124,6 +119,7 @@ const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "bac
 // make no operational sense (e.g. 1e6 concurrent subagents). Permissive enough
 // that any realistic power-user setting passes through.
 const MAX_CONCURRENT_CEILING = 1024;
+const MAX_TREE_LEVELS_CEILING = 16;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 
@@ -138,6 +134,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.maxConcurrent as number) <= MAX_CONCURRENT_CEILING
   ) {
     out.maxConcurrent = r.maxConcurrent as number;
+  }
+  if (
+    Number.isInteger(r.maxTreeLevels)
+    && (r.maxTreeLevels as number) >= 1
+    && (r.maxTreeLevels as number) <= MAX_TREE_LEVELS_CEILING
+  ) {
+    out.maxTreeLevels = r.maxTreeLevels as number;
   }
   if (
     Number.isInteger(r.defaultMaxTurns) &&
@@ -228,6 +231,7 @@ export function saveSettings(s: SubagentsSettings, cwd: string = process.cwd()):
 /** Apply persisted settings to the in-memory state via caller-supplied setters. */
 export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers): void {
   if (typeof s.maxConcurrent === "number") appliers.setMaxConcurrent(s.maxConcurrent);
+  if (typeof s.maxTreeLevels === "number") appliers.setMaxTreeLevels(s.maxTreeLevels);
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);

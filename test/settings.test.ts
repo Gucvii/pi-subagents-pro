@@ -85,6 +85,7 @@ describe("settings persistence", () => {
   it("round-trips values: saveSettings then loadSettings", () => {
     const settings = {
       maxConcurrent: 7,
+      maxTreeLevels: 3,
       defaultMaxTurns: 30,
       graceTurns: 3,
       defaultJoinMode: "smart" as const,
@@ -367,6 +368,7 @@ describe("settings persistence", () => {
     beforeEach(() => {
       appliers = {
         setMaxConcurrent: vi.fn(),
+        setMaxTreeLevels: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -383,6 +385,7 @@ describe("settings persistence", () => {
     it("is a no-op on an empty settings object", () => {
       applySettings({}, appliers);
       expect(appliers.setMaxConcurrent).not.toHaveBeenCalled();
+      expect(appliers.setMaxTreeLevels).not.toHaveBeenCalled();
       expect(appliers.setDefaultMaxTurns).not.toHaveBeenCalled();
       expect(appliers.setGraceTurns).not.toHaveBeenCalled();
       expect(appliers.setDefaultJoinMode).not.toHaveBeenCalled();
@@ -406,6 +409,7 @@ describe("settings persistence", () => {
       applySettings(
         {
           maxConcurrent: 8,
+          maxTreeLevels: 3,
           defaultMaxTurns: 50,
           graceTurns: 7,
           defaultJoinMode: "group",
@@ -419,6 +423,7 @@ describe("settings persistence", () => {
         appliers,
       );
       expect(appliers.setMaxConcurrent).toHaveBeenCalledWith(8);
+      expect(appliers.setMaxTreeLevels).toHaveBeenCalledWith(3);
       expect(appliers.setDefaultMaxTurns).toHaveBeenCalledWith(50);
       expect(appliers.setGraceTurns).toHaveBeenCalledWith(7);
       expect(appliers.setDefaultJoinMode).toHaveBeenCalledWith("group");
@@ -515,6 +520,7 @@ describe("settings persistence", () => {
     beforeEach(() => {
       appliers = {
         setMaxConcurrent: vi.fn(),
+        setMaxTreeLevels: vi.fn(),
         setDefaultMaxTurns: vi.fn(),
         setGraceTurns: vi.fn(),
         setDefaultJoinMode: vi.fn(),
@@ -536,6 +542,7 @@ describe("settings persistence", () => {
       const result = applyAndEmitLoaded(appliers, emit, projectDir);
 
       expect(appliers.setMaxConcurrent).toHaveBeenCalledWith(16);
+      expect(appliers.setMaxTreeLevels).not.toHaveBeenCalled();
       expect(appliers.setGraceTurns).toHaveBeenCalledWith(7);
       expect(appliers.setDefaultMaxTurns).not.toHaveBeenCalled();
       expect(appliers.setDefaultJoinMode).not.toHaveBeenCalled();

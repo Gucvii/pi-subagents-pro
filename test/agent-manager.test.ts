@@ -1022,3 +1022,185 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
     expect(record.result).toBe("new partial progress"); // salvageable, this-run text
   });
 });
+
+describe("AgentManager — bounded Agent tree", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  const ctxAt = (depth: number, maxTreeLevels = 3) => ({
+    cwd: "/tmp",
+    sessionManager: {
+      getSessionId: () => `session-depth-${depth}`,
+      getBranch: () => [{
+        type: "custom",
+        customType: "pi-subagents:lineage",
+        data: {
+          agentId: depth === 0 ? "main" : `agent-${depth}`,
+          parentAgentId: depth === 0 ? undefined : depth === 1 ? "main" : `agent-${depth - 1}`,
+          rootAgentId: "main",
+          depth,
+          maxTreeLevels,
+        },
+      }],
+    },
+  } as any);
+
+  it("assigns trusted parent/root/depth metadata to a child record", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+
+    const id = manager.spawn(mockPi, ctxAt(1), "worker", "go", { description: "nested" });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+
+    expect(record.lineage).toEqual({
+      agentId: id,
+      parentAgentId: "agent-1",
+      rootAgentId: "main",
+      depth: 2,
+      maxTreeLevels: 3,
+    });
+    expect(vi.mocked(runAgent).mock.calls.at(-1)?.[3].lineage).toEqual(record.lineage);
+  });
+
+  it("rejects level four before creating a record or invoking the runner", () => {
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockClear();
+
+    expect(() => manager.spawn(mockPi, ctxAt(2), "worker", "forbidden", { description: "too deep" }))
+      .toThrow("current level 3, maximum 3");
+    expect(manager.listAgents()).toHaveLength(0);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("uses the configured limit for a main session without lineage metadata", () => {
+    vi.mocked(runAgent).mockClear();
+    manager = new AgentManager(undefined, 4, undefined, undefined, 1);
+    const rootCtx = {
+      cwd: "/tmp",
+      sessionManager: { getSessionId: () => "root-only-session", getBranch: () => [] },
+    } as any;
+
+    expect(() => manager.spawn(mockPi, rootCtx, "worker", "forbidden", { description: "root only" }))
+      .toThrow("current level 1, maximum 1");
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentManager — durable cross-process resume", () => {
+  let manager: AgentManager;
+  afterEach(() => manager?.dispose());
+
+  const persisted = (status: "completed" | "running" = "completed") => ({
+    id: "durable-agent",
+    type: "general-purpose",
+    description: "durable task",
+    status,
+    result: status === "completed" ? "FIRST" : undefined,
+    toolUses: 2,
+    startedAt: 100,
+    completedAt: status === "completed" ? 200 : undefined,
+    sessionFile: "/sessions/child.jsonl",
+    sessionCwd: "/repo",
+    lifetimeUsage: { input: 1, output: 2, cacheWrite: 0 },
+    compactionCount: 0,
+    lineage: {
+      agentId: "durable-agent",
+      parentAgentId: "main",
+      rootAgentId: "main",
+      depth: 1,
+      maxTreeLevels: 3,
+    },
+    invocation: { modelName: "test/model", thinking: "off" as const },
+  });
+
+  it("rehydrates stable Agent IDs and marks interrupted runs resumable", () => {
+    const changed = vi.fn();
+    manager = new AgentManager(undefined, 4, undefined, undefined, 3, changed);
+
+    expect(manager.restorePersisted([persisted("running")])).toBe(1);
+    expect(manager.getRecord("durable-agent")).toMatchObject({
+      id: "durable-agent",
+      status: "stopped",
+      sessionFile: "/sessions/child.jsonl",
+      error: expect.stringContaining("previous Pi process exited"),
+    });
+    expect(changed).toHaveBeenCalled();
+  });
+
+  it("lazily opens the durable Pi session only when resume is requested", async () => {
+    manager = new AgentManager();
+    manager.restorePersisted([persisted()]);
+    const reopenedSession = mockSession();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "SECOND",
+      session: reopenedSession,
+      aborted: false,
+      steered: false,
+    });
+
+    const record = await manager.resume("durable-agent", "continue", undefined, {
+      pi: mockPi,
+      ctx: mockCtx,
+      model: { provider: "test", id: "model" } as any,
+      thinkingLevel: "off",
+    });
+
+    expect(record?.result).toBe("SECOND");
+    expect(record?.status).toBe("completed");
+    expect(record?.session).toBe(reopenedSession);
+    expect(vi.mocked(runAgent)).toHaveBeenCalledWith(
+      mockCtx,
+      "general-purpose",
+      "continue",
+      expect.objectContaining({
+        agentId: "durable-agent",
+        resumeSessionFile: "/sessions/child.jsonl",
+        cwd: "/repo",
+        thinkingLevel: "off",
+      }),
+    );
+  });
+
+  it("recreates and cleans worktree isolation when a durable session is resumed", async () => {
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReturnValueOnce({
+      path: "/wt/resume",
+      workPath: "/wt/resume/pkg",
+      branch: "pi-agent-resume",
+      baseSha: "abc",
+    });
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: false });
+    manager = new AgentManager();
+    manager.restorePersisted([{
+      ...persisted(),
+      workspaceBaseCwd: "/repo",
+      configCwd: "/config",
+      invocation: { ...persisted().invocation, isolation: "worktree" as const },
+    }]);
+    const reopenedSession = mockSession();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "ISOLATED",
+      session: reopenedSession,
+      aborted: false,
+      steered: false,
+    });
+
+    const record = await manager.resume("durable-agent", "continue", undefined, {
+      pi: mockPi,
+      ctx: mockCtx,
+      thinkingLevel: "off",
+    });
+
+    expect(createWorktree).toHaveBeenCalledWith("/repo", expect.stringContaining("durable-agent-resume-"));
+    expect(vi.mocked(runAgent).mock.calls.at(-1)?.[3]).toMatchObject({
+      cwd: "/wt/resume/pkg",
+      configCwd: "/config",
+      resumeSessionFile: "/sessions/child.jsonl",
+    });
+    expect(cleanupWorktree).toHaveBeenCalledWith("/repo", expect.objectContaining({ path: "/wt/resume" }), "durable task");
+    expect(reopenedSession.dispose).toHaveBeenCalled();
+    expect(record?.session).toBeUndefined();
+    expect(record?.sessionCwd).toBe("/repo");
+  });
+});

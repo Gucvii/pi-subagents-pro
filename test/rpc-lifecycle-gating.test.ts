@@ -57,8 +57,13 @@ function ctx() {
     hasUI: false,
     ui: { setStatus: vi.fn(), setWidget: vi.fn(), notify: vi.fn() },
     cwd: process.cwd(),
-    model: undefined,
-    modelRegistry: { find: vi.fn(), getAvailable: vi.fn(() => []) },
+    model: { provider: "test", id: "model", name: "Test Model" },
+    modelRegistry: {
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAvailable: vi.fn(() => [{ provider: "test", id: "model", name: "Test Model" }]),
+    },
     sessionManager: { getSessionId: vi.fn(() => "s1"), getBranch: vi.fn(() => []) },
     getSystemPrompt: vi.fn(() => "parent"),
   } as any;
@@ -135,7 +140,11 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
       requestId,
       type: "general-purpose",
       prompt: "go",
-      options: { description: "rpc gating test" },
+      options: {
+        description: "rpc gating test",
+        model: "test/model",
+        thinkingLevel: "off",
+      },
     });
 
     const reply = pi.events.emit.mock.calls.find(

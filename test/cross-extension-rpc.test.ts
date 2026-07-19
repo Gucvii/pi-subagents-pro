@@ -17,6 +17,14 @@ function createEventBus(): EventBus {
 }
 
 describe("cross-extension RPC", () => {
+  const defaultModel = { id: "model", provider: "test", name: "Test Model" };
+  const defaultRegistry = {
+    find: (provider: string, id: string) => provider === "test" && id === "model" ? defaultModel : null,
+    getAll: () => [defaultModel],
+    getAvailable: () => [defaultModel],
+  };
+  const exactOptions = { model: "test/model", thinkingLevel: "off" };
+
   let events: EventBus;
   let manager: SpawnCapable;
   let ctx: object | undefined;
@@ -25,7 +33,7 @@ describe("cross-extension RPC", () => {
   beforeEach(() => {
     events = createEventBus();
     manager = { spawn: vi.fn().mockReturnValue("agent-42"), abort: vi.fn().mockReturnValue(true) };
-    ctx = { session: true };
+    ctx = { session: true, modelRegistry: defaultRegistry };
     deps = { events, pi: { events }, getCtx: () => ctx, manager };
   });
 
@@ -73,13 +81,14 @@ describe("cross-extension RPC", () => {
       const reply = vi.fn();
       events.on("subagents:rpc:spawn:reply:req-s1", reply);
       events.emit("subagents:rpc:spawn", {
-        requestId: "req-s1", type: "general-purpose", prompt: "do stuff",
+        requestId: "req-s1", type: "general-purpose", prompt: "do stuff", options: exactOptions,
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "do stuff", {},
+        deps.pi, ctx, "general-purpose", "do stuff",
+        expect.objectContaining({ model: defaultModel, thinkingLevel: "off" }),
       );
     });
 
@@ -89,13 +98,18 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-s2", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-s2", type: "Explore", prompt: "find it",
-        options: { description: "search", isBackground: true },
+        options: { ...exactOptions, description: "search", isBackground: true },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "Explore", "find it",
-        { description: "search", isBackground: true },
+        expect.objectContaining({
+          model: defaultModel,
+          thinkingLevel: "off",
+          description: "search",
+          isBackground: true,
+        }),
       );
     });
 
@@ -121,7 +135,7 @@ describe("cross-extension RPC", () => {
       const reply = vi.fn();
       events.on("subagents:rpc:spawn:reply:req-s4", reply);
       events.emit("subagents:rpc:spawn", {
-        requestId: "req-s4", type: "bad-type", prompt: "x",
+        requestId: "req-s4", type: "bad-type", prompt: "x", options: exactOptions,
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
@@ -135,7 +149,7 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-other", wrongReply);
       events.on("subagents:rpc:spawn:reply:req-s5", rightReply);
       events.emit("subagents:rpc:spawn", {
-        requestId: "req-s5", type: "general-purpose", prompt: "x",
+        requestId: "req-s5", type: "general-purpose", prompt: "x", options: exactOptions,
       });
 
       await vi.waitFor(() => expect(rightReply).toHaveBeenCalled());
@@ -221,8 +235,8 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-a", reply1);
       events.on("subagents:rpc:spawn:reply:req-b", reply2);
 
-      events.emit("subagents:rpc:spawn", { requestId: "req-a", type: "Explore", prompt: "first" });
-      events.emit("subagents:rpc:spawn", { requestId: "req-b", type: "Plan", prompt: "second" });
+      events.emit("subagents:rpc:spawn", { requestId: "req-a", type: "Explore", prompt: "first", options: exactOptions });
+      events.emit("subagents:rpc:spawn", { requestId: "req-b", type: "Plan", prompt: "second", options: exactOptions });
 
       await vi.waitFor(() => {
         expect(reply1).toHaveBeenCalled();
@@ -257,31 +271,36 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-m1", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-m1", type: "general-purpose", prompt: "x",
-        options: { model: "openai-codex/gpt-5.5" },
+        options: { model: "openai-codex/gpt-5.5", thinkingLevel: "high" },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       expect(reply).toHaveBeenCalledWith({ success: true, data: { id: "agent-42" } });
       expect(manager.spawn).toHaveBeenCalledWith(
         deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
+        expect.objectContaining({
+          model: fakeModel,
+          thinkingLevel: "high",
+          invocation: expect.objectContaining({ modelName: "openai-codex/gpt-5.5", thinking: "high" }),
+        }),
       );
     });
 
-    it("passes a Model object through unchanged", async () => {
+    it("rejects Model objects so RPC identity stays serializable and exact", async () => {
       registerRpcHandlers(deps);
       const reply = vi.fn();
       events.on("subagents:rpc:spawn:reply:req-m2", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-m2", type: "general-purpose", prompt: "x",
-        options: { model: fakeModel },
+        options: { model: fakeModel, thinkingLevel: "high" },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
-      expect(manager.spawn).toHaveBeenCalledWith(
-        deps.pi, ctx, "general-purpose", "x",
-        { model: fakeModel },
-      );
+      expect(reply).toHaveBeenCalledWith({
+        success: false,
+        error: 'RPC spawn requires model as an exact "provider/modelId" string',
+      });
+      expect(manager.spawn).not.toHaveBeenCalled();
     });
 
     it("surfaces a clear error when the model string can't be resolved", async () => {
@@ -290,13 +309,13 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-m3", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-m3", type: "general-purpose", prompt: "x",
-        options: { model: "nope/does-not-exist" },
+        options: { model: "nope/does-not-exist", thinkingLevel: "high" },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());
       const call = (reply as ReturnType<typeof vi.fn>).mock.calls[0][0];
       expect(call.success).toBe(false);
-      expect(call.error).toMatch(/Model not found/);
+      expect(call.error).toMatch(/Exact model not available/);
       expect(manager.spawn).not.toHaveBeenCalled();
     });
 
@@ -307,7 +326,7 @@ describe("cross-extension RPC", () => {
       events.on("subagents:rpc:spawn:reply:req-m4", reply);
       events.emit("subagents:rpc:spawn", {
         requestId: "req-m4", type: "general-purpose", prompt: "x",
-        options: { model: "openai-codex/gpt-5.5" },
+        options: { model: "openai-codex/gpt-5.5", thinkingLevel: "high" },
       });
 
       await vi.waitFor(() => expect(reply).toHaveBeenCalled());

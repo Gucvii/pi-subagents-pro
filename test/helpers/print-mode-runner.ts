@@ -170,14 +170,17 @@ export interface PrintModeRun {
 export function agentCall(
   args: {
     prompt: string;
-    description: string;
+    description?: string;
     subagent_type?: string;
     run_in_background?: boolean;
     [k: string]: unknown;
   },
   opts?: { id?: string },
 ): ToolCall {
-  return fauxToolCall("Agent", { subagent_type: "general-purpose", ...args }, opts);
+  return fauxToolCall("Agent", {
+    subagent_type: "general-purpose",
+    ...args,
+  }, opts);
 }
 
 function resolveReply(
@@ -189,11 +192,12 @@ function resolveReply(
 
 /**
  * The common single-spawn flow as a responder. Routes by inspecting the calling
- * session's own context:
- *   - PARENT  (its tool set includes `Agent`):
- *       · `parentInitial` until an `Agent` tool result is in history (the spawn),
- *       · then `parentFinal` (the answer after the child reports back).
- *   - SUBAGENT (no `Agent` tool): `subagent`.
+ * session's system prompt: child sessions carry `<active_agent ...>`, while the
+ * root session does not. This remains correct now that bounded child sessions
+ * may themselves receive the `Agent` tool.
+ *   - PARENT: `parentInitial` until an `Agent` tool result is in history, then
+ *     `parentFinal`.
+ *   - SUBAGENT: `subagent`.
  * Each route may be a value or a `(ctx) => value` function.
  */
 export function routeBySession(routes: {
@@ -202,8 +206,8 @@ export function routeBySession(routes: {
   subagent: FauxReply | ((ctx: Context) => FauxReply);
 }): FauxResponder {
   return (context) => {
-    const isParent = (context.tools ?? []).some((t) => t.name === "Agent");
-    if (!isParent) return resolveReply(routes.subagent, context);
+    const isSubagent = context.systemPrompt?.includes("<active_agent ") ?? false;
+    if (isSubagent) return resolveReply(routes.subagent, context);
     const spawned = context.messages.some(
       (m) => m.role === "toolResult" && (m as { toolName?: string }).toolName === "Agent",
     );

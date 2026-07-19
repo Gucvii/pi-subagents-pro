@@ -51,10 +51,12 @@ function makeHeadlessCtx() {
       setWidget: vi.fn(),
     },
     cwd: "/tmp",
-    model: undefined,
+    model: { provider: "test", id: "model", name: "Test Model" },
     modelRegistry: {
-      find: vi.fn(),
-      getAvailable: vi.fn(() => []),
+      find: vi.fn((provider: string, id: string) => provider === "test" && id === "model"
+        ? { provider, id, name: "Test Model" }
+        : undefined),
+      getAvailable: vi.fn(() => [{ provider: "test", id: "model", name: "Test Model" }]),
     },
     sessionManager: {
       getSessionId: vi.fn(() => "session-1"),
@@ -88,7 +90,7 @@ describe("print mode background notifications", () => {
       {
         prompt: "reply done",
         description: "tiny child",
-        subagent_type: "general-purpose",
+        subagent_type: "general-purpose", model: "test/model", thinking: "off",
         run_in_background: true,
       },
       undefined,

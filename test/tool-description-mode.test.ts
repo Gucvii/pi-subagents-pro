@@ -83,6 +83,17 @@ describe("toolDescriptionMode", () => {
     rmSync(hermeticAgentDir, { recursive: true, force: true });
   });
 
+  it("keeps execution identity and UI metadata optional in the Agent schema", () => {
+    const tools = setup();
+    const parameters = tools.get("Agent").parameters;
+
+    expect(parameters.required).toEqual(["prompt"]);
+    expect(parameters.properties.model.pattern).toBe("^[^/\\s]+/[^/\\s]+$");
+    expect(parameters.properties.thinking.anyOf.map((entry: { const: string }) => entry.const)).toEqual([
+      "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ]);
+  });
+
   it("defaults to the full description", () => {
     const tools = setup();
     const desc: string = tools.get("Agent").description;
