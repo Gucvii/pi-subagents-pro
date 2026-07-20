@@ -730,6 +730,21 @@ describe("agent-runner session persistence", () => {
     expect(sessionManagerCreate).not.toHaveBeenCalled();
   });
 
+  it("lets an explicit persistence choice override the Agent definition", async () => {
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
+    createAgentSession.mockResolvedValue({ session: createSession("MEMORY").session });
+    await runAgent(ctx, "Explore", "go", { pi, persistSession: false });
+    expect(sessionManagerInMemory).toHaveBeenCalledWith("/tmp");
+    expect(sessionManagerCreate).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: false }));
+    createAgentSession.mockResolvedValue({ session: createSession("DURABLE").session });
+    await runAgent(ctx, "Explore", "go", { pi, persistSession: true });
+    expect(sessionManagerCreate).toHaveBeenCalledWith("/tmp", undefined);
+    expect(sessionManagerInMemory).not.toHaveBeenCalled();
+  });
+
   it("uses pi's normal persistent session location when persistSession is true", async () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ persistSession: true }));
     settingsManagerGetSessionDir.mockReturnValue("/normal/pi/sessions");

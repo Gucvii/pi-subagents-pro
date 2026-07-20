@@ -275,6 +275,8 @@ export interface RunOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /** Explicit child-session persistence override. Omitted follows the Agent definition/default. */
+  persistSession?: boolean;
   /** Override working directory (e.g. for worktree isolation). */
   cwd?: string;
   /**
@@ -696,9 +698,10 @@ export async function runAgent(
   const settingsManager = SettingsManager.create(configCwd, agentDir);
   const configuredSessionDir = resolveConfiguredSessionDir(agentConfig?.sessionDir, effectiveCwd);
   const defaultSessionDir = process.env.PI_CODING_AGENT_SESSION_DIR ?? settingsManager.getSessionDir?.();
+  const persistSession = options.persistSession ?? (agentConfig?.persistSession !== false);
   const sessionManager = options.resumeSessionFile
     ? SessionManager.open(options.resumeSessionFile, undefined, effectiveCwd)
-    : agentConfig?.persistSession !== false
+    : persistSession
       ? SessionManager.create(effectiveCwd, configuredSessionDir ?? defaultSessionDir)
       : SessionManager.inMemory(effectiveCwd);
   if (options.lineage) appendLineageEntry(sessionManager, options.lineage);

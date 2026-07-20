@@ -101,6 +101,8 @@ describe("toolDescriptionMode", () => {
     expect(spawn.properties.thinking.anyOf.map((entry: { const: string }) => entry.const)).toEqual([
       "off", "minimal", "low", "medium", "high", "xhigh", "max",
     ]);
+    expect(spawn.properties.session_persistence.anyOf.map((entry: { const: string }) => entry.const))
+      .toEqual(["durable", "memory"]);
     expect(resume.required).toEqual(["kind", "agent_id", "prompt"]);
     expect(resume.additionalProperties).toBe(false);
     expect(resume.properties).not.toHaveProperty("subagent_type");
@@ -110,9 +112,14 @@ describe("toolDescriptionMode", () => {
     expect(schedule.properties).not.toHaveProperty("resume");
     expect(schedule.properties).not.toHaveProperty("inherit_context");
     expect(schedule.properties).not.toHaveProperty("run_in_background");
+    expect(schedule.properties).not.toHaveProperty("session_persistence");
+    expect(resume.properties).not.toHaveProperty("session_persistence");
 
     expect(Value.Check(parameters, {
       operation: { kind: "spawn", prompt: "inspect", subagent_type: "Explore" },
+    })).toBe(true);
+    expect(Value.Check(parameters, {
+      operation: { kind: "spawn", prompt: "sensitive", subagent_type: "general-purpose", session_persistence: "memory" },
     })).toBe(true);
     expect(Value.Check(parameters, {
       operation: { kind: "resume", agent_id: "agent-1", prompt: "continue" },
@@ -126,6 +133,9 @@ describe("toolDescriptionMode", () => {
     })).toBe(false);
     expect(Value.Check(parameters, {
       operation: { kind: "schedule", schedule: "1h", prompt: "report", subagent_type: "general-purpose", inherit_context: true },
+    })).toBe(false);
+    expect(Value.Check(parameters, {
+      operation: { kind: "schedule", schedule: "1h", prompt: "report", subagent_type: "general-purpose", session_persistence: "memory" },
     })).toBe(false);
   });
 
@@ -149,7 +159,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("- Explore: Fast read-only search agent for locating code. (Tools:");
     expect(desc).not.toContain("very thorough");
     // The point of the feature: materially smaller than the full version.
-    expect(desc.length).toBeLessThan(1900);
+    expect(desc.length).toBeLessThan(2050);
   });
 
   it("invalid mode in the settings file is dropped — full description", () => {

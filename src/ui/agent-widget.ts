@@ -5,10 +5,11 @@
  * Uses the callback form of setWidget for themed rendering.
  */
 
+import { statSync } from "node:fs";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentManager } from "../agent-manager.js";
 import { getConfig } from "../agent-types.js";
-import type { AgentInvocation, SubagentType, WidgetMode } from "../types.js";
+import type { AgentInvocation, AgentRecord, SubagentType, WidgetMode } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent, type LifetimeUsage, type SessionLike } from "../usage.js";
 
 // ---- Constants ----
@@ -173,8 +174,29 @@ export function formatInvocationIdentity(
       ? (invocation.modelName.split("/").pop() ?? invocation.modelName)
       : invocation.modelName
     : undefined;
-  const parts = [model, invocation.thinking ? `effort ${invocation.thinking}` : undefined].filter(Boolean);
+  const persistence = invocation.sessionPersistence ? `${invocation.sessionPersistence} session` : undefined;
+  const parts = [model, invocation.thinking ? `effort ${invocation.thinking}` : undefined, persistence].filter(Boolean);
   return parts.length > 0 ? parts.join(" · ") : undefined;
+}
+
+export function formatStorageBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+export function getAgentSessionStorage(record: Pick<AgentRecord, "invocation" | "sessionFile">): {
+  persistence: "durable" | "memory";
+  path?: string;
+  sizeBytes?: number;
+} {
+  const persistence = record.invocation?.sessionPersistence ?? "durable";
+  if (persistence === "memory" || !record.sessionFile) return { persistence };
+  try {
+    return { persistence, path: record.sessionFile, sizeBytes: statSync(record.sessionFile).size };
+  } catch {
+    return { persistence, path: record.sessionFile };
+  }
 }
 
 /** Mode label is not included — callers add it where they want it. */
@@ -189,6 +211,7 @@ export function buildInvocationTags(
   if (invocation.inheritContext) tags.push("inherit context");
   if (invocation.runInBackground) tags.push("background");
   if (invocation.maxTurns != null) tags.push(`max turns: ${invocation.maxTurns}`);
+  if (invocation.sessionPersistence) tags.push(`${invocation.sessionPersistence} session`);
   return { modelName: invocation.modelName, tags };
 }
 

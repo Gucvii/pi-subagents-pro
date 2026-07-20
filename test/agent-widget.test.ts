@@ -54,11 +54,12 @@ describe("agent invocation presentation", () => {
       thinking: "max",
       runInBackground: true,
       inheritContext: false,
+      sessionPersistence: "durable",
     }, theme);
 
     expect(component.render(200).map(line => line.trimEnd())).toEqual([
       "◆ Reviewer  复核旧插件缺陷  BACKGROUND",
-      "  opencode-go/deepseek-v4-flash · effort max · fresh context",
+      "  opencode-go/deepseek-v4-flash · effort max · fresh context · durable session",
       "  └─ prompt Read the implementation and report only verified issues.",
     ]);
   });
@@ -80,11 +81,12 @@ describe("agent invocation presentation", () => {
       ...call,
       model: "openai-codex/gpt-5.6-sol",
       thinking: "medium",
+      sessionPersistence: "memory" as const,
     }, theme, component);
 
     expect(updated).toBe(component);
     expect(updated.render(200).map(line => line.trimEnd())).toContain(
-      "  openai-codex/gpt-5.6-sol · effort medium · fresh context",
+      "  openai-codex/gpt-5.6-sol · effort medium · fresh context · memory session",
     );
     expect(updated.render(200).join("\n")).not.toContain("<inherit main>");
   });
@@ -104,7 +106,8 @@ describe("agent invocation presentation", () => {
     expect(formatInvocationIdentity({
       modelName: "opencode-go/deepseek-v4-flash",
       thinking: "max",
-    }, true)).toBe("deepseek-v4-flash · effort max");
+      sessionPersistence: "durable",
+    }, true)).toBe("deepseek-v4-flash · effort max · durable session");
   });
 });
 

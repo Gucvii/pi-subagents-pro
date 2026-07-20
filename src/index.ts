@@ -17,7 +17,7 @@ import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Tex
 import { Type } from "@sinclair/typebox";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
-import { AgentSessionStore, findPersistedAgentRecord, resolveAgentSessionStorePath, resolveAgentSessionStorePathFromParts, resolveDurableAgentSessionStorePath } from "./agent-session-store.js";
+import { AgentSessionStore, inspectAgentSessionFile, lookupPersistedAgentRecord, resolveAgentSessionStorePath, resolveAgentSessionStorePathFromParts, resolveDurableAgentSessionStorePath } from "./agent-session-store.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
@@ -41,8 +41,10 @@ import {
   fgPreservingNestedStyles,
   formatDuration,
   formatMs,
+  formatStorageBytes,
   formatTokens,
   formatTurns,
+  getAgentSessionStorage,
   getDisplayName,
   getPromptModeLabel,
   SPINNER,
@@ -68,6 +70,7 @@ export interface AgentCallDisplay {
   thinking?: string;
   runInBackground: boolean;
   inheritContext: boolean;
+  sessionPersistence?: "durable" | "memory";
 }
 
 /** Collapse a prompt into a readable one-line preview for the invocation card. */
@@ -111,8 +114,9 @@ export function renderAgentCallCard(
       : thinking
         ? theme.fg("muted", "inherits main model") + theme.fg("dim", " · ") + theme.fg("warning", `effort ${thinking}`)
         : theme.fg("muted", "inherits main");
+  const persistence = call.sessionPersistence ? `${call.sessionPersistence} session` : undefined;
   const metadata =
-    "  " + identity + theme.fg("dim", " · ") + theme.fg("muted", context);
+    "  " + identity + theme.fg("dim", " · ") + theme.fg("muted", [context, persistence].filter(Boolean).join(" · "));
   const prompt = `  ${theme.fg("dim", "└─ prompt")} ${theme.fg("toolOutput", formatPromptPreview(call.prompt))}`;
 
   const component = existing ?? new Text("", 0, 0);
@@ -462,6 +466,7 @@ export default function (pi: ExtensionAPI) {
   // UI session. Background completions therefore remain attached to their
   // original parent even if the user switches sessions mid-run.
   const agentSessionStores = new Map<string, AgentSessionStore>();
+  const reportedAgentStoreIssues = new Set<string>();
   const parentSessionsByRoot = new Map<string, ExtensionContext["sessionManager"]>();
   const parentSessionsById = new Map<string, ExtensionContext["sessionManager"]>();
   const getAgentSessionStore = (path: string): AgentSessionStore => {
@@ -484,14 +489,16 @@ export default function (pi: ExtensionAPI) {
       pi.events.emit("subagents:completed", eventData);
     }
 
-    // Persist final record for cross-extension history reconstruction
-    pi.appendEntry("subagents:record", {
-      id: record.id, type: record.type, description: record.description,
-      status: record.status, result: record.result, error: record.error,
-      startedAt: record.startedAt, completedAt: record.completedAt,
-      lineage: record.lineage, sessionFile: record.sessionFile,
-      invocation: record.invocation,
-    });
+    // Memory sessions leave no extension-owned durable Agent record.
+    if (record.invocation?.sessionPersistence !== "memory") {
+      pi.appendEntry("subagents:record", {
+        id: record.id, type: record.type, description: record.description,
+        status: record.status, result: record.result, error: record.error,
+        startedAt: record.startedAt, completedAt: record.completedAt,
+        lineage: record.lineage, sessionFile: record.sessionFile,
+        invocation: record.invocation,
+      });
+    }
 
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
@@ -535,6 +542,7 @@ export default function (pi: ExtensionAPI) {
       compactionCount: record.compactionCount,
     });
   }, undefined, (record) => {
+    if (record.invocation?.sessionPersistence === "memory") return;
     const parentSession = (record.parentSessionId ? parentSessionsById.get(record.parentSessionId) : undefined)
       ?? parentSessionsByRoot.get(record.lineage.rootAgentId);
     const storePath = resolveDurableAgentSessionStorePath(
@@ -549,7 +557,16 @@ export default function (pi: ExtensionAPI) {
         const file = parentSession?.getSessionFile?.();
         return file ? dirname(file) : undefined;
       })();
-      getAgentSessionStore(storePath).upsert(record);
+      try {
+        getAgentSessionStore(storePath).upsert(record);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.warn(`[pi-subagents] Failed to persist Agent "${record.id}": ${message}`);
+        if (!reportedAgentStoreIssues.has(storePath)) {
+          reportedAgentStoreIssues.add(storePath);
+          if (currentCtx?.hasUI) currentCtx.ui.notify(`${message}. Existing index was not modified.`, "warning");
+        }
+      }
     }
   });
 
@@ -628,20 +645,28 @@ export default function (pi: ExtensionAPI) {
       ) ?? resolveAgentSessionStorePath(ctx.sessionManager);
       if (storePath) {
         const store = getAgentSessionStore(storePath);
-        const parentSessionDir = ctx.sessionManager.getSessionDir() || (() => {
-          const file = ctx.sessionManager.getSessionFile();
-          return file ? dirname(file) : undefined;
-        })();
-        const restored = manager.restorePersisted(store.list().map((record) => ({
-          ...record,
-          parentCwd: record.parentCwd ?? ctx.cwd,
-          parentSessionId: record.parentSessionId ?? ctx.sessionManager.getSessionId(),
-          parentSessionDir: record.parentSessionDir ?? parentSessionDir,
-        })));
-        if (restored > 0) {
-          pi.events.emit("subagents:sessions_restored", { count: restored, rootAgentId: lineage.rootAgentId });
-          widget.update();
-          fleet.update();
+        const issue = store.getIssue();
+        if (issue) {
+          const label = issue.kind === "corrupt-index" ? "corrupt" : "unreadable";
+          const message = `Agent session index is ${label}: ${issue.path}. It was not modified.`;
+          console.warn(`[pi-subagents] ${message} ${issue.message}`);
+          if (ctx.hasUI) ctx.ui.notify(message, "warning");
+        } else {
+          const parentSessionDir = ctx.sessionManager.getSessionDir() || (() => {
+            const file = ctx.sessionManager.getSessionFile();
+            return file ? dirname(file) : undefined;
+          })();
+          const restored = manager.restorePersisted(store.list().map((record) => ({
+            ...record,
+            parentCwd: record.parentCwd ?? ctx.cwd,
+            parentSessionId: record.parentSessionId ?? ctx.sessionManager.getSessionId(),
+            parentSessionDir: record.parentSessionDir ?? parentSessionDir,
+          })));
+          if (restored > 0) {
+            pi.events.emit("subagents:sessions_restored", { count: restored, rootAgentId: lineage.rootAgentId });
+            widget.update();
+            fleet.update();
+          }
         }
       }
     } catch (error) {
@@ -889,6 +914,7 @@ Notes:
 - Put all operation-specific fields inside operation. Use kind="spawn" with prompt + subagent_type, kind="resume" with agent_id + prompt, or kind="schedule" with schedule + prompt + subagent_type.
 - description is optional UI metadata for spawn/schedule; when omitted it is derived from the prompt. Spawn prompts must be self-contained.
 - model and thinking are optional for spawn/schedule; when omitted they inherit the main agent's current model and effort. Resume always reuses its original identity.
+- Spawn defaults to session_persistence="durable". Use "memory" for a process-local child conversation with no Agent session, index, or .output transcript.
 - Parallel work: one message, multiple Agent calls with operation.run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
 - operation.kind="resume" continues a previous agent by ID, including after restarting Pi; steer_subagent messages a running one.
@@ -921,6 +947,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Omit \`model\` and \`thinking\` on spawn/schedule to inherit the main identity. Resume always reuses its original identity.
+- Spawn uses \`session_persistence: "durable"\` by default. Use \`"memory"\` for a process-local child conversation: it writes no Agent session/index/transcript and cannot resume after Pi exits.
 - Nested delegation is bounded by maxTreeLevels (default 3, counting the main agent as level 1). A maximum-level agent does not receive Agent tools; never try to bypass the limit.
 - Use \`operation.inherit_context\` on spawn when the child needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
@@ -984,7 +1011,11 @@ Terse command-style prompts produce shallow, generic work.
     }
     return fullAgentToolDescription;
   })();
-  type ResolvedCallIdentity = { model: string; thinking: NonNullable<AgentInvocation["thinking"]> };
+  type ResolvedCallIdentity = {
+    model: string;
+    thinking: NonNullable<AgentInvocation["thinking"]>;
+    sessionPersistence: "durable" | "memory";
+  };
   type AgentCallRenderState = { resolvedIdentity?: ResolvedCallIdentity };
   const agentCallIdentitySetters = new Map<string, (identity: ResolvedCallIdentity) => void>();
 
@@ -1035,6 +1066,12 @@ Terse command-style prompts produce shallow, generic work.
       description: "Fork the parent conversation into the new Agent. Default: false.",
     })),
     isolation: worktreeSchema,
+    session_persistence: Type.Optional(Type.Union([
+      Type.Literal("durable"),
+      Type.Literal("memory"),
+    ], {
+      description: "Child conversation persistence. Durable survives Pi restarts (default); memory expires with this Pi process and writes no Agent session/transcript.",
+    })),
   }, { additionalProperties: false, description: "Create a new Agent session." });
 
   const resumeOperationSchema = Type.Object({
@@ -1078,6 +1115,7 @@ Terse command-style prompts produce shallow, generic work.
     inherit_context?: boolean;
     isolation?: "worktree";
     schedule?: string;
+    session_persistence?: "durable" | "memory";
   };
   const normalizeAgentParams = (raw: unknown): NormalizedAgentParams => {
     const input = raw as { operation?: Record<string, unknown> } & Partial<NormalizedAgentParams>;
@@ -1126,6 +1164,7 @@ Terse command-style prompts produce shallow, generic work.
         thinking: identity?.thinking ?? invocation.thinking,
         runInBackground: invocation.runInBackground,
         inheritContext: invocation.inheritContext,
+        sessionPersistence: identity?.sessionPersistence ?? invocation.sessionPersistence,
       }, theme, context.lastComponent instanceof Text ? context.lastComponent : undefined);
     },
 
@@ -1139,7 +1178,7 @@ Terse command-style prompts produce shallow, generic work.
       // The call card owns model/effort; result stats show only non-identity execution data.
       const stats = (d: AgentDetails) => {
         const parts: string[] = [];
-        if (d.tags) parts.push(...d.tags.filter(tag => !tag.startsWith("thinking: ")));
+        if (d.tags) parts.push(...d.tags.filter(tag => !tag.startsWith("thinking: ") && !tag.endsWith(" session")));
         if (d.turnCount != null && d.turnCount > 0) {
           parts.push(formatTurns(d.turnCount, d.maxTurns));
         }
@@ -1236,19 +1275,45 @@ Terse command-style prompts produce shallow, generic work.
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
 
       let resumeRecord = params.resume ? manager.getRecord(params.resume) : undefined;
+      let lookupIssues: ReturnType<typeof lookupPersistedAgentRecord>["issues"] = [];
       if (params.resume && !resumeRecord) {
-        const persisted = findPersistedAgentRecord(getAgentDir(), ctx.cwd, params.resume);
-        if (persisted) {
-          getAgentSessionStore(persisted.storePath);
-          manager.restorePersisted([persisted.record]);
+        const lookup = lookupPersistedAgentRecord(getAgentDir(), ctx.cwd, params.resume);
+        lookupIssues = lookup.issues;
+        if (lookup.match) {
+          getAgentSessionStore(lookup.match.storePath);
+          manager.restorePersisted([lookup.match.record]);
           resumeRecord = manager.getRecord(params.resume);
         }
       }
       if (params.resume && !resumeRecord) {
-        return textResult(`Agent not found: "${params.resume}".`);
+        if (lookupIssues.length > 0) {
+          const paths = lookupIssues.map(issue => `  ${issue.path} (${issue.kind})`).join("\n");
+          return textResult(
+            `Agent "${params.resume}" was not found, but ${lookupIssues.length} Agent index file(s) could not be inspected:\n${paths}\nNo files were modified.`,
+          );
+        }
+        return textResult(`Agent "${params.resume}" was not found in this project.`);
       }
       if (params.resume && !resumeRecord?.session && !resumeRecord?.sessionFile) {
-        return textResult(`Agent "${params.resume}" has no durable session to resume.`);
+        const persistence = resumeRecord?.invocation?.sessionPersistence;
+        return textResult(persistence === "memory"
+          ? `Agent "${params.resume}" used a memory session and is no longer available in this Pi process.`
+          : `Agent "${params.resume}" metadata exists, but it has no durable session file reference.`);
+      }
+      if (params.resume && resumeRecord?.sessionFile && !resumeRecord.session) {
+        const inspection = inspectAgentSessionFile(resumeRecord.sessionFile);
+        if (!inspection.ok) {
+          const reason = {
+            missing: "is missing",
+            permission: "cannot be read because permission was denied",
+            "not-file": "does not point to a regular file",
+            corrupt: `is corrupt (${inspection.message})`,
+            unreadable: `is unreadable (${inspection.message})`,
+          }[inspection.kind];
+          return textResult(
+            `Agent "${params.resume}" cannot be resumed: its durable session file ${reason}.\n\nFile:\n${inspection.path}\n\nThe Agent metadata and file were not modified.`,
+          );
+        }
       }
       const resumedModelName = resumeRecord?.invocation?.modelName ?? (resumeRecord?.session?.model
         ? `${resumeRecord.session.model.provider}/${resumeRecord.session.model.id}`
@@ -1293,17 +1358,28 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
       }
-      agentCallIdentitySetters.get(toolCallId)?.({ model: modelName, thinking });
+      agentCallIdentitySetters.get(toolCallId)?.({
+        model: modelName,
+        thinking,
+        sessionPersistence: params.resume
+          ? resumeRecord?.invocation?.sessionPersistence ?? "durable"
+          : resolvedConfig.sessionPersistence,
+      });
       const inheritContext = resolvedConfig.inheritContext;
       const runInBackground = resolvedConfig.runInBackground;
       const isolated = resolvedConfig.isolated;
       const isolation = resolvedConfig.isolation;
+      const sessionPersistence = params.resume
+        ? resumeRecord?.invocation?.sessionPersistence ?? "durable"
+        : resolvedConfig.sessionPersistence;
       // Whether this spawn writes its .output transcript. Per-agent
       // frontmatter (`output_transcript`) wins; otherwise the project/global
       // default applies. `attachTranscript` below is the SOLE gate — every
       // downstream consumer keys off record.outputFile being set, so no spawn
       // path can re-enable the transcript by accident.
-      const outputTranscript = customConfig?.outputTranscript ?? getOutputTranscriptDefault();
+      const outputTranscript = sessionPersistence === "memory"
+        ? false
+        : customConfig?.outputTranscript ?? getOutputTranscriptDefault();
       const attachTranscript = (rec: AgentRecord | undefined, agentId: string): void => {
         if (!rec || !outputTranscript) return;
         rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
@@ -1321,6 +1397,7 @@ Terse command-style prompts produce shallow, generic work.
         inheritContext,
         runInBackground,
         isolation,
+        sessionPersistence,
       };
       // Tool-result render shows the mode label too; viewer's header already does.
       const modeLabel = getPromptModeLabel(subagentType);
@@ -1338,6 +1415,9 @@ Terse command-style prompts produce shallow, generic work.
       if (params.schedule) {
         if (!isSchedulingEnabled()) {
           return textResult("Scheduling is disabled in this project. Enable via /agents → Settings → Scheduling.");
+        }
+        if (sessionPersistence === "memory") {
+          return textResult("Cannot schedule a memory session — scheduled jobs persist their prompt and require a durable Agent session.");
         }
         if (params.resume) {
           return textResult("Cannot combine `schedule` with `resume` — schedules create fresh agents.");
@@ -1424,6 +1504,7 @@ Terse command-style prompts produce shallow, generic work.
             thinkingLevel: thinking,
             isBackground: true,
             isolation,
+            persistSession: sessionPersistence === "durable",
             invocation: agentInvocation,
             ...bgCallbacks,
           });
@@ -1473,6 +1554,8 @@ Terse command-style prompts produce shallow, generic work.
           `Agent ID: ${id}\n` +
           `Type: ${displayName}\n` +
           `Description: ${description}\n` +
+          `Persistence: ${sessionPersistence}\n` +
+          (sessionPersistence === "memory" ? "This Agent ID is valid only for the current Pi process.\n" : "") +
           (record?.outputFile ? `Output file: ${record.outputFile}\n` : "") +
           (isQueued ? `Position: queued (max ${manager.getMaxConcurrent()} concurrent)\n` : "") +
           `\nYou will be notified when this agent completes.\n` +
@@ -1552,6 +1635,7 @@ Terse command-style prompts produce shallow, generic work.
           inheritContext,
           thinkingLevel: thinking,
           isolation,
+          persistSession: sessionPersistence === "durable",
           invocation: agentInvocation,
           signal,
           ...fgCallbacks,
@@ -1899,7 +1983,9 @@ Terse command-style prompts produce shallow, generic work.
     const options = agents.map(a => {
       const dn = getDisplayName(a.type);
       const dur = formatDuration(a.startedAt, a.completedAt);
-      return `${dn} (${a.description}) · ${a.toolUses} tools · ${a.status} · ${dur}`;
+      const storage = getAgentSessionStorage(a);
+      const size = storage.sizeBytes == null ? "" : ` ${formatStorageBytes(storage.sizeBytes)}`;
+      return `${dn} (${a.description}) · ${storage.persistence}${size} · ${a.toolUses} tools · ${a.status} · ${dur}`;
     });
 
     const choice = await ctx.ui.select("Running agents", options);
@@ -1917,7 +2003,21 @@ Terse command-style prompts produce shallow, generic work.
 
   async function viewAgentConversation(ctx: ExtensionCommandContext, record: AgentRecord) {
     if (!record.session) {
-      ctx.ui.notify(`Agent is ${record.status === "queued" ? "queued" : "expired"} — no session available.`, "info");
+      const storage = getAgentSessionStorage(record);
+      const created = new Date(record.createdAt ?? record.startedAt).toLocaleString();
+      const resumed = record.lastResumedAt ? new Date(record.lastResumedAt).toLocaleString() : "never";
+      if (storage.persistence === "memory") {
+        ctx.ui.notify(
+          `Memory session · no session file · valid only in the Pi process that created it · created ${created}`,
+          "info",
+        );
+      } else {
+        const size = storage.sizeBytes == null ? "unknown" : formatStorageBytes(storage.sizeBytes);
+        ctx.ui.notify(
+          `Durable session · ${size} · created ${created} · last resumed ${resumed}\n${storage.path ?? "Session file unavailable"}`,
+          storage.path ? "info" : "warning",
+        );
+      }
       return;
     }
 

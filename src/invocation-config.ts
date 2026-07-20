@@ -1,4 +1,4 @@
-import type { AgentConfig, IsolationMode, JoinMode, ThinkingLevel } from "./types.js";
+import type { AgentConfig, IsolationMode, JoinMode, SessionPersistence, ThinkingLevel } from "./types.js";
 
 interface AgentInvocationParams {
   model?: string;
@@ -8,6 +8,7 @@ interface AgentInvocationParams {
   inherit_context?: boolean;
   isolated?: boolean;
   isolation?: IsolationMode;
+  session_persistence?: SessionPersistence;
 }
 
 export function resolveAgentInvocationConfig(
@@ -21,6 +22,7 @@ export function resolveAgentInvocationConfig(
   runInBackground: boolean;
   isolated: boolean;
   isolation?: IsolationMode;
+  sessionPersistence: SessionPersistence;
 } {
   return {
     // Explicit call values override an agent pin. When neither exists, the
@@ -32,6 +34,7 @@ export function resolveAgentInvocationConfig(
     runInBackground: agentConfig?.runInBackground ?? params.run_in_background ?? false,
     isolated: agentConfig?.isolated ?? params.isolated ?? false,
     isolation: agentConfig?.isolation ?? params.isolation,
+    sessionPersistence: params.session_persistence ?? (agentConfig?.persistSession === false ? "memory" : "durable"),
   };
 }
 

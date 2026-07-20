@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -111,6 +111,36 @@ describe("output_transcript agent wiring", () => {
     expect(createOutputFilePath).not.toHaveBeenCalled();
     expect(writeInitialEntry).not.toHaveBeenCalled();
     expect(streamToOutputFile).not.toHaveBeenCalled();
+    await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
+  });
+
+  it("memory session_persistence suppresses both the Pi session and extension transcript/index", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+
+    await tools.get("Agent").execute(
+      "tool-call",
+      {
+        operation: {
+          kind: "spawn",
+          prompt: "process sensitive data",
+          subagent_type: "general-purpose",
+          model: "test/model",
+          thinking: "off",
+          session_persistence: "memory",
+        },
+      },
+      undefined,
+      undefined,
+      makeCtx(cwd),
+    );
+
+    expect(vi.mocked(runAgent).mock.calls.at(-1)?.[3]).toMatchObject({ persistSession: false });
+    expect(createOutputFilePath).not.toHaveBeenCalled();
+    expect(writeInitialEntry).not.toHaveBeenCalled();
+    expect(streamToOutputFile).not.toHaveBeenCalled();
+    expect(pi.appendEntry).not.toHaveBeenCalledWith("subagents:record", expect.anything());
+    expect(existsSync(join(agentDir, "subagent-sessions"))).toBe(false);
     await lifecycle.get("session_shutdown")?.({}, makeCtx(cwd));
   });
 

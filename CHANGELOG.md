@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Bounded nested Agent delegation.** Subagents below the configured limit now receive this package's Agent/result/steer tools even when the parent extension was loaded directly by path. Every spawn receives immutable `agentId`/`parentAgentId`/`rootAgentId`/`depth` lineage, persisted as Pi session metadata and enforced centrally across normal, scheduled, and RPC spawns. `maxTreeLevels` defaults to `3` and counts the main agent as level 1; maximum-level sessions do not receive nested Agent tools, and `AgentManager` rejects bypass attempts before creating records, sessions, worktrees, or model calls.
 - **Durable Agent sessions and stable IDs by default.** New Agents now use normal persisted Pi sessions unless their definition explicitly sets `persist_session: false`. A PID-locked, atomic Agent index under `<agentDir>/subagent-sessions/` restores completed and interrupted records after restart; resume lazily opens the child JSONL only when requested, preserving conversation, model, effort, and tree lineage without eagerly loading every historical session. Interrupted runs become stopped-but-resumable instead of silently disappearing.
+- **Call-level Agent session governance.** Spawn operations accept `session_persistence: "durable" | "memory"` with call > frontmatter > durable-default precedence. Memory sessions remain usable only in the current Pi process and write no child Session JSONL, durable Agent index, completion record, or `.output` transcript. UI cards, Fleet rows, conversation details, and `/agents` now expose persistence; durable details include live file size/path plus creation and last-resume timestamps.
 
 ### Changed
 - **Agent calls now inherit the main agent's model and effort when omitted.** `model`, `thinking`, and the UI-only `description` are optional; descriptions derive from the task prompt, while new and scheduled runs require `subagent_type` and resumed runs reuse their original execution identity. Explicit model overrides remain strict exact `provider/modelId` values, scheduled jobs freeze the resolved identity at creation, and the built-in `Explore` agent no longer pins Haiku.
@@ -17,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Agent invocation cards now replace inheritance placeholders with the resolved execution identity.** Before execution, omitted identity fields render as a single clean `inherits main` state; once validation resolves the child identity, the same card updates in place to the exact `provider/modelId` and effort. Running and completion stats no longer duplicate model/effort already shown by the call card.
+- **Durable resume failures are now precise and non-destructive.** Explicit resume distinguishes unknown IDs, incomplete lookup due to unreadable/corrupt parent indexes, missing session references, missing files, permission failures, non-file paths, and malformed JSONL. Corrupt index files are never silently overwritten; startup warns and leaves them untouched.
 ## [0.14.2] - 2026-07-17
 
 ### Added

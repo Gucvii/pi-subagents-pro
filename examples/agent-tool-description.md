@@ -24,6 +24,7 @@ If the target is already known, use a direct tool — `read` for a known path, `
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Omit `model` and `thinking` on spawn/schedule to inherit the main identity. Resume always reuses its original identity.
+- Spawn uses `session_persistence: "durable"` by default. Use `"memory"` for a process-local child conversation: it writes no Agent session/index/transcript and cannot resume after Pi exits.
 - Nested delegation is bounded by maxTreeLevels (default 3, counting the main agent as level 1). A maximum-level agent does not receive Agent tools; never try to bypass the limit.
 - Use `operation.inherit_context` on spawn when the child needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.{{scheduleGuideline}}

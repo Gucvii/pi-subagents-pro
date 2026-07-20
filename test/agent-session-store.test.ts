@@ -1,10 +1,12 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AgentSessionStore,
   findPersistedAgentRecord,
+  inspectAgentSessionFile,
+  lookupPersistedAgentRecord,
   resolveAgentSessionStorePath,
   resolveDurableAgentSessionStorePath,
   toPersistedAgentRecord,
@@ -25,6 +27,8 @@ function record(overrides: Partial<AgentRecord> = {}): AgentRecord {
     result: "DONE",
     toolUses: 4,
     startedAt: 100,
+    createdAt: 50,
+    lastResumedAt: 90,
     completedAt: 200,
     lifetimeUsage: { input: 10, output: 20, cacheWrite: 3 },
     compactionCount: 1,
@@ -72,6 +76,8 @@ describe("AgentSessionStore", () => {
       id: "agent-1",
       result: "UPDATED",
       toolUses: 5,
+      createdAt: 50,
+      lastResumedAt: 90,
       sessionFile: "/sessions/child.jsonl",
     });
   });
@@ -89,6 +95,36 @@ describe("AgentSessionStore", () => {
       record: { id: "target", sessionFile: "/sessions/child.jsonl" },
     });
     expect(findPersistedAgentRecord(agentDir, "/different-repo", "target")).toBeUndefined();
+  });
+
+  it("reports corrupt indexes and never overwrites them during a mutation", () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-dir-"));
+    dirs.push(agentDir);
+    const path = resolveDurableAgentSessionStorePath(agentDir, "/repo", "parent-corrupt")!;
+    new AgentSessionStore(path).upsert(record());
+    writeFileSync(path, "{ definitely not json", "utf-8");
+
+    const store = new AgentSessionStore(path);
+    expect(store.getIssue()).toMatchObject({ kind: "corrupt-index", path });
+    expect(() => store.upsert(record())).toThrow(/index is corrupt/);
+    expect(readFileSync(path, "utf-8")).toBe("{ definitely not json");
+
+    const lookup = lookupPersistedAgentRecord(agentDir, "/repo", "unknown");
+    expect(lookup.match).toBeUndefined();
+    expect(lookup.issues).toEqual([expect.objectContaining({ kind: "corrupt-index", path })]);
+  });
+
+  it("distinguishes valid, missing, and corrupt durable session files", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-agent-session-file-"));
+    dirs.push(dir);
+    const valid = join(dir, "valid.jsonl");
+    const corrupt = join(dir, "corrupt.jsonl");
+    writeFileSync(valid, '{"type":"session"}\n{"type":"message"}\n', "utf-8");
+    writeFileSync(corrupt, '{"type":"session"}\nnot-json\n', "utf-8");
+
+    expect(inspectAgentSessionFile(valid)).toMatchObject({ ok: true });
+    expect(inspectAgentSessionFile(join(dir, "missing.jsonl"))).toMatchObject({ ok: false, kind: "missing" });
+    expect(inspectAgentSessionFile(corrupt)).toMatchObject({ ok: false, kind: "corrupt", message: "invalid JSONL at line 2" });
   });
 
   it("uses a stable agent-dir index even when Pi does not expose a parent session directory", () => {

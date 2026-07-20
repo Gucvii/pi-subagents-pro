@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { AgentRecord, AgentSessionStoreData, PersistedAgentRecord } from "./types.js";
 
@@ -11,6 +11,16 @@ type ParentSessionManager = {
   getSessionId?: () => string;
   getSessionFile?: () => string | undefined;
 };
+
+export type AgentSessionStoreIssue = {
+  kind: "unreadable-index" | "corrupt-index";
+  path: string;
+  message: string;
+};
+
+export type AgentSessionFileInspection =
+  | { ok: true; sizeBytes: number }
+  | { ok: false; kind: "missing" | "permission" | "not-file" | "corrupt" | "unreadable"; path: string; message: string };
 
 function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -84,6 +94,8 @@ export function toPersistedAgentRecord(record: AgentRecord): PersistedAgentRecor
     error: record.error,
     toolUses: record.toolUses,
     startedAt: record.startedAt,
+    createdAt: record.createdAt,
+    lastResumedAt: record.lastResumedAt,
     completedAt: record.completedAt,
     parentCwd: record.parentCwd,
     parentSessionId: record.parentSessionId,
@@ -122,6 +134,7 @@ function isPersistedRecord(value: unknown): value is PersistedAgentRecord {
 export class AgentSessionStore {
   private readonly lockPath: string;
   private agents = new Map<string, PersistedAgentRecord>();
+  private loadIssue?: AgentSessionStoreIssue;
 
   constructor(private readonly filePath: string) {
     this.lockPath = `${filePath}.lock`;
@@ -129,14 +142,26 @@ export class AgentSessionStore {
   }
 
   private load(): void {
+    this.loadIssue = undefined;
+    this.agents.clear();
     if (!existsSync(this.filePath)) return;
     try {
       const data = JSON.parse(readFileSync(this.filePath, "utf-8")) as AgentSessionStoreData;
-      this.agents.clear();
-      for (const record of data.agents ?? []) {
-        if (isPersistedRecord(record)) this.agents.set(record.id, record);
+      if (data?.version !== 1 || !Array.isArray(data.agents)) {
+        throw new SyntaxError("invalid Agent session index schema");
       }
-    } catch { /* corrupt store is ignored; the next successful mutation repairs it */ }
+      for (const record of data.agents) {
+        if (!isPersistedRecord(record)) throw new SyntaxError("invalid Agent record in session index");
+        this.agents.set(record.id, record);
+      }
+    } catch (error: any) {
+      const kind = error?.code ? "unreadable-index" : "corrupt-index";
+      this.loadIssue = {
+        kind,
+        path: this.filePath,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   private save(): void {
@@ -151,12 +176,19 @@ export class AgentSessionStore {
     acquireLock(this.lockPath);
     try {
       this.load();
+      if (this.loadIssue) {
+        throw new Error(`Agent session index is ${this.loadIssue.kind === "corrupt-index" ? "corrupt" : "unreadable"}: ${this.filePath}`);
+      }
       const result = mutation();
       this.save();
       return result;
     } finally {
       releaseLock(this.lockPath);
     }
+  }
+
+  getIssue(): AgentSessionStoreIssue | undefined {
+    return this.loadIssue ? { ...this.loadIssue } : undefined;
   }
 
   list(): PersistedAgentRecord[] {
@@ -169,24 +201,83 @@ export class AgentSessionStore {
   }
 }
 
-/** Explicit resume fallback: locate an Agent ID from any parent session in this project. */
+export type PersistedAgentLookup = {
+  match?: { record: PersistedAgentRecord; storePath: string };
+  issues: AgentSessionStoreIssue[];
+};
+
+/** Explicit resume fallback with diagnostics for unreadable/corrupt parent indexes. */
+export function lookupPersistedAgentRecord(
+  agentDir: string,
+  parentCwd: string,
+  agentId: string,
+): PersistedAgentLookup {
+  const projectDir = join(agentDir, "subagent-sessions", projectStoreKey(parentCwd));
+  if (!existsSync(projectDir)) return { issues: [] };
+  let files: string[];
+  try {
+    files = readdirSync(projectDir).filter((file) => file.endsWith(".json"));
+  } catch (error) {
+    return { issues: [{
+      kind: "unreadable-index",
+      path: projectDir,
+      message: error instanceof Error ? error.message : String(error),
+    }] };
+  }
+  const issues: AgentSessionStoreIssue[] = [];
+  for (const file of files) {
+    const storePath = join(projectDir, file);
+    const store = new AgentSessionStore(storePath);
+    const issue = store.getIssue();
+    if (issue) {
+      issues.push(issue);
+      continue;
+    }
+    const record = store.list().find((candidate) => candidate.id === agentId);
+    if (record) return { match: { record, storePath }, issues };
+  }
+  return { issues };
+}
+
+/** Backwards-compatible lookup for callers that do not need diagnostics. */
 export function findPersistedAgentRecord(
   agentDir: string,
   parentCwd: string,
   agentId: string,
 ): { record: PersistedAgentRecord; storePath: string } | undefined {
-  const projectDir = join(agentDir, "subagent-sessions", projectStoreKey(parentCwd));
-  if (!existsSync(projectDir)) return undefined;
-  let files: string[];
+  return lookupPersistedAgentRecord(agentDir, parentCwd, agentId).match;
+}
+
+/** Validate a durable child JSONL before attempting a lazy resume. */
+export function inspectAgentSessionFile(filePath: string): AgentSessionFileInspection {
+  let sizeBytes: number;
   try {
-    files = readdirSync(projectDir).filter((file) => file.endsWith(".json"));
-  } catch {
-    return undefined;
+    const stat = statSync(filePath);
+    if (!stat.isFile()) {
+      return { ok: false, kind: "not-file", path: filePath, message: "the session path is not a file" };
+    }
+    sizeBytes = stat.size;
+  } catch (error: any) {
+    const kind = error?.code === "ENOENT" ? "missing" : error?.code === "EACCES" ? "permission" : "unreadable";
+    return { ok: false, kind, path: filePath, message: error instanceof Error ? error.message : String(error) };
   }
-  for (const file of files) {
-    const storePath = join(projectDir, file);
-    const record = new AgentSessionStore(storePath).list().find((candidate) => candidate.id === agentId);
-    if (record) return { record, storePath };
+
+  try {
+    const lines = readFileSync(filePath, "utf-8").split("\n");
+    let entries = 0;
+    for (let index = 0; index < lines.length; index++) {
+      const line = lines[index].trim();
+      if (!line) continue;
+      try { JSON.parse(line); entries++; } catch {
+        return { ok: false, kind: "corrupt", path: filePath, message: `invalid JSONL at line ${index + 1}` };
+      }
+    }
+    if (entries === 0) {
+      return { ok: false, kind: "corrupt", path: filePath, message: "session JSONL is empty" };
+    }
+  } catch (error: any) {
+    const kind = error?.code === "EACCES" ? "permission" : "unreadable";
+    return { ok: false, kind, path: filePath, message: error instanceof Error ? error.message : String(error) };
   }
-  return undefined;
+  return { ok: true, sizeBytes };
 }

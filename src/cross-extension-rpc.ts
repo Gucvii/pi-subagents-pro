@@ -9,6 +9,7 @@
  *   error   → { success: false, error: string }
  */
 
+import { getAgentConfig } from "./agent-types.js";
 import { type ModelRegistry, resolveExactModel } from "./model-resolver.js";
 import type { ThinkingLevel } from "./types.js";
 
@@ -100,6 +101,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       const resolved = resolveExactModel(normalizedOptions.model, registry);
       if (typeof resolved === "string") throw new Error(resolved);
       const canonicalModelName = `${resolved.provider}/${resolved.id}`;
+      const sessionPersistence = getAgentConfig(type)?.persistSession === false ? "memory" : "durable";
       const invocation = {
         modelName: canonicalModelName,
         thinking,
@@ -108,6 +110,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
         inheritContext: normalizedOptions.inheritContext,
         runInBackground: normalizedOptions.isBackground,
         isolation: normalizedOptions.isolation,
+        sessionPersistence,
       };
 
       return {
@@ -115,6 +118,7 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
           ...normalizedOptions,
           model: resolved,
           thinkingLevel: thinking,
+          persistSession: sessionPersistence === "durable",
           invocation,
         }),
       };

@@ -12,6 +12,7 @@ import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getAgentConfig } from "./agent-types.js";
 import { createChildLineage, DEFAULT_MAX_TREE_LEVELS, normalizeMaxTreeLevels, resolveSessionLineage } from "./lineage.js";
 import type { AgentInvocation, AgentLineage, AgentRecord, IsolationMode, PersistedAgentRecord, SubagentType, ThinkingLevel } from "./types.js";
 import { addUsage } from "./usage.js";
@@ -64,6 +65,8 @@ interface SpawnOptions {
   isolated?: boolean;
   inheritContext?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /** Persist the child conversation as a durable Pi session. Default: true. */
+  persistSession?: boolean;
   isBackground?: boolean;
   /**
    * Skip the maxConcurrent queue check for this spawn — start immediately even
@@ -195,6 +198,8 @@ export class AgentManager {
     const parentLineage = resolvedParentLineage.depth === 0
       ? { ...resolvedParentLineage, maxTreeLevels: this.maxTreeLevels }
       : resolvedParentLineage;
+    const persistSession = options.persistSession ?? (getAgentConfig(type)?.persistSession !== false);
+    options = { ...options, persistSession };
     const id = randomUUID().slice(0, 17);
     const lineage = createChildLineage(parentLineage, id);
     const abortController = new AbortController();
@@ -205,6 +210,7 @@ export class AgentManager {
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
+      createdAt: Date.now(),
       parentCwd: ctx.cwd,
       parentSessionId: ctx.sessionManager?.getSessionId?.(),
       parentSessionDir: ctx.sessionManager?.getSessionDir?.(),
@@ -218,7 +224,10 @@ export class AgentManager {
       // have no inline surface — stay visible instead of vanishing.
       isBackground: options.isBackground,
       lineage,
-      invocation: options.invocation,
+      invocation: {
+        ...options.invocation,
+        sessionPersistence: persistSession ? "durable" : "memory",
+      },
     };
     this.agents.set(id, record);
 
@@ -302,6 +311,7 @@ export class AgentManager {
       isolated: options.isolated,
       inheritContext: options.inheritContext,
       thinkingLevel: options.thinkingLevel,
+      persistSession: options.persistSession,
       // Worktree wins for the working dir (the agent must run in the copy —
       // which, with a custom cwd, was created from that target). Config stays
       // with the parent project when a caller-supplied cwd is in play; it must
@@ -512,6 +522,8 @@ export class AgentManager {
       const record: AgentRecord = {
         ...persisted,
         status: interrupted ? "stopped" : persisted.status,
+        createdAt: persisted.createdAt ?? persisted.startedAt,
+        lastResumedAt: persisted.lastResumedAt,
         error: interrupted
           ? "The previous Pi process exited before this Agent completed. Resume to continue."
           : persisted.error,
@@ -537,7 +549,9 @@ export class AgentManager {
     if (!record || (!record.session && (!record.sessionFile || !runtime))) return undefined;
 
     record.status = "running";
-    record.startedAt = Date.now();
+    const resumedAt = Date.now();
+    record.startedAt = resumedAt;
+    record.lastResumedAt = resumedAt;
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;

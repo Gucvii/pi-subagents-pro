@@ -253,6 +253,7 @@ export class SubagentScheduler {
         isolated: job.isolated,
         thinkingLevel: job.thinking,
         isolation: job.isolation,
+        persistSession: true,
         invocation: {
           modelName: job.model,
           thinking: job.thinking,
@@ -260,6 +261,7 @@ export class SubagentScheduler {
           isolated: job.isolated,
           runInBackground: true,
           isolation: job.isolation,
+          sessionPersistence: "durable",
         },
       });
     } catch (err) {

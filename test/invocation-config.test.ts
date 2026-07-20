@@ -103,6 +103,19 @@ describe("resolveAgentInvocationConfig", () => {
     expect(resolved.runInBackground).toBe(false);
     expect(resolved.isolated).toBe(false);
   });
+
+  it("resolves session persistence with call > frontmatter > durable default precedence", () => {
+    expect(resolveAgentInvocationConfig(undefined, {}).sessionPersistence).toBe("durable");
+    expect(resolveAgentInvocationConfig(makeConfig({ persistSession: false }), {}).sessionPersistence).toBe("memory");
+    expect(resolveAgentInvocationConfig(
+      makeConfig({ persistSession: true }),
+      { session_persistence: "memory" },
+    ).sessionPersistence).toBe("memory");
+    expect(resolveAgentInvocationConfig(
+      makeConfig({ persistSession: false }),
+      { session_persistence: "durable" },
+    ).sessionPersistence).toBe("durable");
+  });
 });
 
 describe("resolveJoinMode", () => {

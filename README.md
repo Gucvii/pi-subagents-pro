@@ -140,9 +140,22 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, every Agent is also a normal durable Pi session in Pi's session directory. A small Agent-ID index is stored at `<agentDir>/subagent-sessions/<project-hash>/<parent-session-id>.json`; reopening the parent restores its Agent list automatically, while `Agent({ operation: { kind: "resume", agent_id: "<id>", prompt: "..." } })` can locate the ID from any later parent session in the same project. Resume lazily opens the child JSONL with its original model, effort, lineage, conversation, and worktree policy. Runs interrupted by process exit remain resumable. Set `persist_session: false` only for an explicitly memory-only custom agent.
+By default, every Agent is also a normal durable Pi session in Pi's session directory. A small Agent-ID index is stored at `<agentDir>/subagent-sessions/<project-hash>/<parent-session-id>.json`; reopening the parent restores its Agent list automatically, while `Agent({ operation: { kind: "resume", agent_id: "<id>", prompt: "..." } })` can locate the ID from any later parent session in the same project. Resume lazily opens the child JSONL with its original model, effort, lineage, conversation, and worktree policy. Runs interrupted by process exit remain resumable.
 
-Separately, foreground and background agents stream a convenience `.output` transcript to `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to suppress it, or set `outputTranscript: false` in `subagents.json` project-wide. This transcript is independent of the durable Pi session, `isolation: worktree`, and `memory:`. Background completion notifications render as styled boxes:
+For a one-off child conversation, set `session_persistence: "memory"` on a spawn operation. The Agent remains usable in the current Pi process, but writes no child Session JSONL, durable Agent index, or `.output` transcript; its ID cannot be resumed after Pi exits. This setting governs extension-owned conversation state only — the Agent's tools can still modify project files.
+
+```ts
+Agent({
+  operation: {
+    kind: "spawn",
+    prompt: "Analyze this one-off input",
+    subagent_type: "general-purpose",
+    session_persistence: "memory",
+  },
+})
+```
+
+Durable foreground and background Agents also stream a convenience `.output` transcript to `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom Agent to suppress it, or `outputTranscript: false` in `subagents.json` project-wide. A memory session always suppresses this transcript. Worktree files and the separate `memory:` frontmatter feature are outside this setting's scope. Background completion notifications render as styled boxes:
 
 ```
 ✓ Find auth files completed
@@ -230,8 +243,8 @@ All fields are optional — sensible defaults for everything.
 | `model` | inherit main | Optional exact `provider/modelId` pin for this agent. An explicit `Agent` call override wins |
 | `thinking` | inherit main | Optional effort pin: off, minimal, low, medium, high, xhigh, or max. An explicit call override wins |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
-| `persist_session` | `true` | Persist as a normal Pi session and preserve the Agent ID for cross-restart resume. Set `false` for an explicitly memory-only agent. Independent of the optional `.output` transcript |
-| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
+| `persist_session` | `true` | Persist as a normal Pi session and preserve the Agent ID for cross-restart resume. `false` makes this custom Agent memory-only and also suppresses its `.output` transcript. A spawn operation's `session_persistence` overrides this default |
+| `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this Agent's `.output` transcript; a memory session always suppresses it. Otherwise this frontmatter value overrides the project default. Independent of worktree commits and the separate `memory:` feature |
 | `session_dir` | pi default | Optional durable session directory; omitted uses Pi's normal session location, and relative paths resolve from the agent cwd |
 | `prompt_mode` | `replace` | `replace`: body is the full system prompt (no AGENTS.md / CLAUDE.md inheritance). `append`: body appended to parent's prompt (agent acts as a "parent twin" — inherits parent's AGENTS.md / CLAUDE.md) |
 | `inherit_context` | `false` | Fork parent conversation into agent |
@@ -403,7 +416,7 @@ Runtime tuning values set via `/agents` → Settings (max concurrency, maximum A
 
 **Disable defaults** (`disableDefaultAgents`, default `false`): when on, the three built-in agents (general-purpose, Explore, Plan) are not registered — only your project/global custom agents are advertised and spawnable. User-defined agents are unaffected, including ones that override a default by name. The Agent tool's type list updates on the next pi session (the tool schema is registered at startup).
 
-**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each subagent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide — useful when run transcripts shouldn't sit on disk for backup or DLP tooling to pick up. A custom agent's `output_transcript` frontmatter overrides this per agent. Applied live at spawn time. Governs only the transcript, not `persist_session`, worktree commits, or memory files.
+**Output transcript** (`outputTranscript`, default `true`): the project/global default for writing each durable Agent's `.output` transcript. Toggle via `/agents → Settings → Output transcript`, or set `false` in `subagents.json` to make transcripts opt-in project-wide. A custom Agent's `output_transcript` frontmatter overrides this per Agent, while `session_persistence: "memory"` always suppresses it. Worktree commits and persistent memory files remain outside this setting.
 
 **Tool description** (`toolDescriptionMode`, default `"full"`): which Agent tool description the LLM sees. `"full"` is the rich Claude Code-style prompt (~1,400 tokens with the default agents); `"compact"` is ~75% smaller — one-line agent type list, terse usage notes — for small/local models where tool-spec tokens are expensive. Per-option details stay in the parameter descriptions in every mode (the parameter schema is never customizable). Applies on the next pi session.
 

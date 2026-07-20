@@ -20,6 +20,9 @@ export type MemoryScope = "user" | "project" | "local";
 /** Isolation mode for agent execution. */
 export type IsolationMode = "worktree";
 
+/** Persistence of the child conversation session itself. */
+export type SessionPersistence = "durable" | "memory";
+
 /** Unified agent configuration — used for both default and user-defined agents. */
 export interface AgentConfig {
   name: string;
@@ -101,6 +104,10 @@ export interface AgentRecord {
   error?: string;
   toolUses: number;
   startedAt: number;
+  /** First creation time; unlike startedAt, this is not replaced on resume. */
+  createdAt?: number;
+  /** Most recent explicit resume time. */
+  lastResumedAt?: number;
   completedAt?: number;
   session?: AgentSession;
   /** Parent Pi session that owns this Agent ID and durable index entry. */
@@ -168,6 +175,8 @@ export interface PersistedAgentRecord {
   error?: string;
   toolUses: number;
   startedAt: number;
+  createdAt?: number;
+  lastResumedAt?: number;
   completedAt?: number;
   parentCwd?: string;
   parentSessionId?: string;
@@ -198,6 +207,8 @@ export interface AgentInvocation {
   isolated?: boolean;
   inheritContext?: boolean;
   runInBackground?: boolean;
+  /** Durable by default; memory sessions expire with the current Pi process. */
+  sessionPersistence?: SessionPersistence;
   isolation?: IsolationMode;
 }
 
