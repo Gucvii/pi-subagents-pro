@@ -1,7 +1,8 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { AgentRecord, AgentSessionStoreData, PersistedAgentRecord } from "./types.js";
+import { validatePersistedAgentLineage } from "./lineage.js";
+import type { AgentRecord, AgentSessionStoreData, MailboxMessage, PersistedAgentRecord } from "./types.js";
 
 const LOCK_RETRY_MS = 50;
 const LOCK_MAX_RETRIES = 100;
@@ -26,17 +27,41 @@ function isProcessRunning(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-function acquireLock(path: string): void {
+type LockOwner = { pid: number; token: string };
+
+function serializeLock(owner: LockOwner): string {
+  return JSON.stringify(owner);
+}
+
+function parseLock(value: string): LockOwner | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<LockOwner>;
+    return Number.isInteger(parsed.pid) && (parsed.pid as number) > 0 && typeof parsed.token === "string" && parsed.token.length > 0
+      ? { pid: parsed.pid as number, token: parsed.token }
+      : undefined;
+  } catch {
+    // Legacy PID-only locks remain eligible for stale cleanup.
+    const pid = Number.parseInt(value, 10);
+    return pid > 0 ? { pid, token: "legacy" } : undefined;
+  }
+}
+
+function acquireLock(path: string): LockOwner {
+  const owner = { pid: process.pid, token: randomUUID() };
+  const serialized = serializeLock(owner);
   for (let attempt = 0; attempt < LOCK_MAX_RETRIES; attempt++) {
     try {
-      writeFileSync(path, `${process.pid}`, { flag: "wx" });
-      return;
+      writeFileSync(path, serialized, { flag: "wx" });
+      return owner;
     } catch (error: any) {
       if (error.code !== "EEXIST") throw error;
       try {
-        const pid = Number.parseInt(readFileSync(path, "utf-8"), 10);
-        if (pid && !isProcessRunning(pid)) {
-          unlinkSync(path);
+        const observed = readFileSync(path, "utf-8");
+        const stale = parseLock(observed);
+        if (stale && !isProcessRunning(stale.pid)) {
+          // Re-read immediately before unlinking. This does not make stale recovery
+          // perfectly atomic, but prevents deleting a lock replaced since inspection.
+          if (readFileSync(path, "utf-8") === observed) unlinkSync(path);
           continue;
         }
       } catch { /* retry */ }
@@ -47,8 +72,10 @@ function acquireLock(path: string): void {
   throw new Error(`Failed to acquire agent session store lock: ${path}`);
 }
 
-function releaseLock(path: string): void {
-  try { unlinkSync(path); } catch { /* ignore */ }
+function releaseLock(path: string, owner: LockOwner): void {
+  try {
+    if (readFileSync(path, "utf-8") === serializeLock(owner)) unlinkSync(path);
+  } catch { /* already gone or replaced */ }
 }
 
 /** No path for an in-memory parent session: it cannot be resumed after restart. */
@@ -119,21 +146,54 @@ function isPersistedRecord(value: unknown): value is PersistedAgentRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<PersistedAgentRecord>;
   return typeof record.id === "string"
+    && record.id.length > 0
     && typeof record.type === "string"
     && typeof record.description === "string"
     && typeof record.status === "string"
     && typeof record.startedAt === "number"
     && typeof record.toolUses === "number"
     && typeof record.compactionCount === "number"
-    && !!record.lineage
-    && typeof record.lineage.depth === "number"
-    && typeof record.lineage.maxTreeLevels === "number";
+    && validatePersistedAgentLineage({ id: record.id, lineage: record.lineage }).ok;
+}
+
+function isMailboxMessage(value: unknown): value is MailboxMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<MailboxMessage>;
+  return typeof message.message_id === "string"
+    && message.message_id.length > 0
+    && message.message_id.length <= 128
+    && typeof message.from_agent_id === "string"
+    && message.from_agent_id.length > 0
+    && message.from_agent_id.length <= 128
+    && typeof message.to_agent_id === "string"
+    && message.to_agent_id.length > 0
+    && message.to_agent_id.length <= 128
+    && typeof message.message === "string"
+    && Buffer.byteLength(message.message, "utf8") <= 16 * 1024
+    && typeof message.created_at === "string"
+    && message.created_at.length > 0
+    && (message.acknowledged_at === undefined || typeof message.acknowledged_at === "string");
+}
+
+function isMailboxMessageForPersistedRelation(
+  message: MailboxMessage,
+  agents: Iterable<PersistedAgentRecord>,
+): boolean {
+  for (const record of agents) {
+    const parentId = record.lineage.parentAgentId;
+    if (!parentId) continue;
+    const down = message.from_agent_id === parentId && message.to_agent_id === record.id;
+    const up = message.from_agent_id === record.id && message.to_agent_id === parentId;
+    if (down || up) return true;
+  }
+  return false;
 }
 
 /** Session-scoped durable index from Agent ID to the child's normal Pi session. */
 export class AgentSessionStore {
   private readonly lockPath: string;
   private agents = new Map<string, PersistedAgentRecord>();
+  private mailbox: MailboxMessage[] = [];
   private loadIssue?: AgentSessionStoreIssue;
 
   constructor(private readonly filePath: string) {
@@ -144,6 +204,7 @@ export class AgentSessionStore {
   private load(): void {
     this.loadIssue = undefined;
     this.agents.clear();
+    this.mailbox = [];
     if (!existsSync(this.filePath)) return;
     try {
       const data = JSON.parse(readFileSync(this.filePath, "utf-8")) as AgentSessionStoreData;
@@ -153,6 +214,17 @@ export class AgentSessionStore {
       for (const record of data.agents) {
         if (!isPersistedRecord(record)) throw new SyntaxError("invalid Agent record in session index");
         this.agents.set(record.id, record);
+      }
+      if (data.mailbox !== undefined) {
+        if (
+          !Array.isArray(data.mailbox)
+          || !data.mailbox.every((message) =>
+            isMailboxMessage(message)
+            && isMailboxMessageForPersistedRelation(message, this.agents.values()))
+        ) {
+          throw new SyntaxError("invalid mailbox state or sender relation in Agent session index");
+        }
+        this.mailbox = data.mailbox.map((message) => ({ ...message }));
       }
     } catch (error: any) {
       const kind = error?.code ? "unreadable-index" : "corrupt-index";
@@ -165,26 +237,35 @@ export class AgentSessionStore {
   }
 
   private save(): void {
-    const data: AgentSessionStoreData = { version: 1, agents: [...this.agents.values()] };
+    const data: AgentSessionStoreData = {
+      version: 1,
+      agents: [...this.agents.values()],
+      ...(this.mailbox.length > 0 && { mailbox: this.mailbox }),
+    };
     const temporary = `${this.filePath}.tmp`;
     writeFileSync(temporary, JSON.stringify(data, null, 2), "utf-8");
     renameSync(temporary, this.filePath);
   }
 
-  private withLock<T>(mutation: () => T): T {
+  private withLock<T>(operation: () => T, save = true): T {
     mkdirSync(dirname(this.filePath), { recursive: true });
-    acquireLock(this.lockPath);
+    const lockOwner = acquireLock(this.lockPath);
     try {
       this.load();
       if (this.loadIssue) {
         throw new Error(`Agent session index is ${this.loadIssue.kind === "corrupt-index" ? "corrupt" : "unreadable"}: ${this.filePath}`);
       }
-      const result = mutation();
-      this.save();
+      const result = operation();
+      if (save) this.save();
       return result;
     } finally {
-      releaseLock(this.lockPath);
+      releaseLock(this.lockPath, lockOwner);
     }
+  }
+
+  /** Re-read disk state, allowing a repaired index to clear a previous issue. */
+  reload(): void {
+    this.load();
   }
 
   getIssue(): AgentSessionStoreIssue | undefined {
@@ -198,6 +279,41 @@ export class AgentSessionStore {
   upsert(record: AgentRecord): void {
     const persisted = toPersistedAgentRecord(record);
     this.withLock(() => this.agents.set(persisted.id, persisted));
+  }
+
+  sendMailboxMessage(message: MailboxMessage): void {
+    this.withLock(() => {
+      if (
+        !isMailboxMessage(message)
+        || !isMailboxMessageForPersistedRelation(message, this.agents.values())
+      ) {
+        throw new Error("Mailbox message does not match a persisted direct Agent relation.");
+      }
+      this.mailbox.push({ ...message });
+    });
+  }
+
+  receiveMailboxMessages(toAgentId: string): MailboxMessage[] {
+    return this.withLock(
+      () => this.mailbox
+        .filter((message) => message.to_agent_id === toAgentId && message.acknowledged_at === undefined)
+        .map((message) => ({ ...message })),
+      false,
+    );
+  }
+
+  ackMailboxMessages(toAgentId: string, messageIds: string[]): number {
+    const ids = new Set(messageIds);
+    return this.withLock(() => {
+      const acknowledgedAt = new Date().toISOString();
+      let matched = 0;
+      for (const message of this.mailbox) {
+        if (message.to_agent_id !== toAgentId || !ids.has(message.message_id)) continue;
+        matched++;
+        message.acknowledged_at ??= acknowledgedAt;
+      }
+      return matched;
+    });
   }
 }
 

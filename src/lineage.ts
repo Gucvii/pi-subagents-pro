@@ -137,6 +137,65 @@ export function resolveSessionLineage(
   return root;
 }
 
+export type RestoredChildValidation = { ok: true } | { ok: false; reason: string };
+
+/** Validate immutable lineage loaded from any durable Agent index. */
+export function validatePersistedAgentLineage(
+  record: { id: unknown; lineage: unknown },
+): RestoredChildValidation {
+  if (typeof record.id !== "string" || record.id.trim().length === 0) {
+    return { ok: false, reason: "record id is empty" };
+  }
+  if (!record.lineage || typeof record.lineage !== "object") {
+    return { ok: false, reason: "lineage is missing" };
+  }
+  const lineage = record.lineage as Partial<AgentLineage>;
+  if (typeof lineage.agentId !== "string" || lineage.agentId.trim().length === 0) {
+    return { ok: false, reason: "lineage agent id is empty" };
+  }
+  if (record.id !== lineage.agentId) {
+    return { ok: false, reason: "record id does not match lineage agent id" };
+  }
+  if (typeof lineage.rootAgentId !== "string" || lineage.rootAgentId.trim().length === 0) {
+    return { ok: false, reason: "lineage root id is empty" };
+  }
+  if (typeof lineage.parentAgentId !== "string" || lineage.parentAgentId.trim().length === 0) {
+    return { ok: false, reason: "lineage parent id is empty" };
+  }
+  if (!Number.isInteger(lineage.depth) || (lineage.depth as number) < 1) {
+    return { ok: false, reason: "lineage depth is invalid" };
+  }
+  if (
+    !Number.isInteger(lineage.maxTreeLevels)
+    || (lineage.maxTreeLevels as number) < MIN_MAX_TREE_LEVELS
+    || (lineage.maxTreeLevels as number) > MAX_MAX_TREE_LEVELS
+    || (lineage.depth as number) >= (lineage.maxTreeLevels as number)
+  ) {
+    return { ok: false, reason: "lineage tree limit is invalid" };
+  }
+  return { ok: true };
+}
+
+/** Fail-closed validation for a record loaded from the current parent's durable index. */
+export function validateRestoredDirectChild(
+  record: { id: unknown; lineage: unknown },
+  current: AgentLineage,
+): RestoredChildValidation {
+  const persisted = validatePersistedAgentLineage(record);
+  if (!persisted.ok) return persisted;
+  const lineage = record.lineage as AgentLineage;
+  if (lineage.rootAgentId !== current.rootAgentId) {
+    return { ok: false, reason: "lineage root does not match the current tree" };
+  }
+  if (lineage.parentAgentId !== current.agentId) {
+    return { ok: false, reason: "lineage is not a direct child of the current session" };
+  }
+  if (lineage.depth !== current.depth + 1) {
+    return { ok: false, reason: "lineage depth is not one below the current session" };
+  }
+  return { ok: true };
+}
+
 export function canSpawnChild(lineage: AgentLineage): boolean {
   return lineage.depth + 1 < lineage.maxTreeLevels;
 }

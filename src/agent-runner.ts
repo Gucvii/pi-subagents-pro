@@ -23,6 +23,7 @@ import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
 import { appendLineageEntry, canSpawnChild } from "./lineage.js";
+import { MAILBOX_TOOL_NAME } from "./mailbox.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
@@ -38,10 +39,15 @@ export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  MAILBOX: MAILBOX_TOOL_NAME,
 } as const;
 
-/** Tools withheld from legacy or maximum-level child sessions. */
-const EXCLUDED_TOOL_NAMES: string[] = Object.values(SUBAGENT_TOOL_NAMES);
+/** Recursive delegation tools withheld from maximum-level child sessions. */
+const RECURSIVE_TOOL_NAMES: string[] = [
+  SUBAGENT_TOOL_NAMES.AGENT,
+  SUBAGENT_TOOL_NAMES.GET_RESULT,
+  SUBAGENT_TOOL_NAMES.STEER,
+];
 const THIS_MODULE_PATH = fileURLToPath(import.meta.url);
 const SELF_EXTENSION_PATH = join(dirname(THIS_MODULE_PATH), `index${extname(THIS_MODULE_PATH)}`);
 
@@ -439,6 +445,7 @@ export async function runAgent(
   // Build prompt extras (memory, skill preloading)
   const extras: PromptExtras = {};
   if (options.lineage) extras.agentTree = options.lineage;
+  const allowMailbox = options.lineage !== undefined;
   const allowSubagentTools = options.lineage ? canSpawnChild(options.lineage) : false;
   // Resolve extensions/skills: isolated overrides to false
   const extensions = options.isolated ? false : config.extensions;
@@ -535,7 +542,7 @@ export async function runAgent(
   // A parent may itself have been loaded via `pi -e path` rather than installed
   // in settings. Explicitly carry this extension into delegating child sessions
   // so an advertised Agent tool always has a bound implementation.
-  const carrySelfExtension = allowSubagentTools
+  const carrySelfExtension = allowMailbox
     && loadAll
     && !extensionCanonicalNames(SELF_EXTENSION_PATH).some((name) => excludeNames.has(name));
   const additionalExtensionPathsList = [
@@ -681,12 +688,13 @@ export async function runAgent(
     }
   }
 
-  // Nested delegation is opt-in through trusted lineage. Legacy/direct runner
-  // callers remain non-recursive; a maximum-level child does not even see this
-  // extension's tools. AgentManager independently rejects over-depth spawns.
+  // Recursive delegation and mailbox visibility are gated separately. Legacy/direct
+  // runner callers see neither. Maximum-level children retain mailbox access to their
+  // direct parent while Agent/result/steer remain hidden.
   const builtinToolNameSet = new Set(toolNames);
   const allowedTools = [...toolNames, ...extensionToolNames].filter((t) => {
-    if (EXCLUDED_TOOL_NAMES.includes(t) && !allowSubagentTools) return false;
+    if (RECURSIVE_TOOL_NAMES.includes(t) && !allowSubagentTools) return false;
+    if (t === SUBAGENT_TOOL_NAMES.MAILBOX && !allowMailbox) return false;
     if (disallowedSet?.has(t)) return false;
     if (builtinToolNameSet.has(t)) return true;
     // Reached only for extension tools. The extension set was already filtered

@@ -22,6 +22,7 @@ export type OnAgentComplete = (record: AgentRecord) => void;
 export type OnAgentStart = (record: AgentRecord) => void;
 export type OnAgentCompact = (record: AgentRecord, info: CompactionInfo) => void;
 export type OnAgentChanged = (record: AgentRecord) => void;
+export type OnAgentRemoved = (record: AgentRecord) => void;
 export type CompactionInfo = { reason: "manual" | "threshold" | "overflow"; tokensBefore: number };
 
 /** Default max concurrent background agents. */
@@ -117,6 +118,7 @@ export class AgentManager {
   private onStart?: OnAgentStart;
   private onCompact?: OnAgentCompact;
   private onChanged?: OnAgentChanged;
+  private onRemoved?: OnAgentRemoved;
   private maxConcurrent: number;
   private maxTreeLevels: number;
   /** Base repos worktrees were created from — so dispose() can prune them all,
@@ -135,11 +137,13 @@ export class AgentManager {
     onCompact?: OnAgentCompact,
     maxTreeLevels = DEFAULT_MAX_TREE_LEVELS,
     onChanged?: OnAgentChanged,
+    onRemoved?: OnAgentRemoved,
   ) {
     this.onComplete = onComplete;
     this.onStart = onStart;
     this.onCompact = onCompact;
     this.onChanged = onChanged;
+    this.onRemoved = onRemoved;
     this.maxConcurrent = maxConcurrent;
     this.maxTreeLevels = normalizeMaxTreeLevels(maxTreeLevels);
     // Cleanup completed agents after 10 minutes (but keep sessions for resume)
@@ -244,7 +248,7 @@ export class AgentManager {
     try {
       this.startAgent(id, record, args);
     } catch (err) {
-      this.agents.delete(id);
+      this.removeRecord(id, record);
       throw err;
     }
     return id;
@@ -705,7 +709,8 @@ export class AgentManager {
   private removeRecord(id: string, record: AgentRecord): void {
     record.session?.dispose?.();
     record.session = undefined;
-    this.agents.delete(id);
+    if (!this.agents.delete(id)) return;
+    try { this.onRemoved?.(record); } catch { /* cleanup side effects are isolated */ }
   }
 
   private cleanup() {
@@ -784,10 +789,9 @@ export class AgentManager {
     clearInterval(this.cleanupInterval);
     // Clear queue
     this.queue = [];
-    for (const record of this.agents.values()) {
-      record.session?.dispose();
+    for (const [id, record] of [...this.agents]) {
+      this.removeRecord(id, record);
     }
-    this.agents.clear();
     // Prune any orphaned git worktrees (crash recovery)
     try { pruneWorktrees(process.cwd()); } catch { /* ignore */ }
     // Also prune repos that caller-supplied cwds created worktrees in — a clean

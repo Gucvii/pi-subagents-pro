@@ -195,9 +195,20 @@ export interface PersistedAgentRecord {
   invocation?: AgentInvocation;
 }
 
+export interface MailboxMessage {
+  message_id: string;
+  from_agent_id: string;
+  to_agent_id: string;
+  message: string;
+  created_at: string;
+  acknowledged_at?: string;
+}
+
 export interface AgentSessionStoreData {
   version: 1;
   agents: PersistedAgentRecord[];
+  /** Additive mailbox state; absent in legacy version 1 indexes. */
+  mailbox?: MailboxMessage[];
 }
 export interface AgentInvocation {
   /** Effective provider/model identifier used by the child. */

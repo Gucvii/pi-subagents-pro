@@ -223,6 +223,25 @@ describe("AgentManager — Bug 3 clearCompleted", () => {
     manager?.dispose();
   });
 
+  it("clearCompleted and dispose invoke the removal callback exactly once per record", async () => {
+    const removed = vi.fn();
+    manager = new AgentManager(undefined, 4, undefined, undefined, 3, undefined, removed);
+    resolvedRun();
+    const first = manager.spawn(mockPi, mockCtx, "general-purpose", "one", { description: "one" });
+    const second = manager.spawn(mockPi, mockCtx, "general-purpose", "two", { description: "two" });
+    await Promise.all([manager.getRecord(first)!.promise, manager.getRecord(second)!.promise]);
+
+    manager.clearCompleted();
+    expect(removed).toHaveBeenCalledTimes(2);
+    expect(removed.mock.calls.map(([record]) => record.id).sort()).toEqual([first, second].sort());
+
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    const third = manager.spawn(mockPi, mockCtx, "general-purpose", "three", { description: "three" });
+    manager.dispose();
+    expect(removed).toHaveBeenCalledTimes(3);
+    expect(removed).toHaveBeenLastCalledWith(expect.objectContaining({ id: third }));
+  });
+
   it("clearCompleted removes completed records", async () => {
     manager = new AgentManager();
     resolvedRun();

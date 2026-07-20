@@ -5,7 +5,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 
 ## Features
 
-- **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
+- **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`, `mailbox`)
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
@@ -13,6 +13,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 - **Custom agent types** — define reusable prompts, tools, skills, isolation policy, and optional model/effort pins in project or global Markdown files
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context
+- **Asynchronous parent/child mailbox** — direct parents and children exchange at-least-once messages without steering or mutating conversation history; durable mail survives restart, while memory-session mail remains process-only
 - **Bounded nested delegation** — subagents may delegate one level deeper when useful, with immutable persisted lineage and a hard `maxTreeLevels` guard (default `3`: main → child → grandchild). Maximum-level sessions do not receive Agent tools, while `AgentManager` rejects bypass attempts from schedules or RPC
 - **Graceful turn limits** — agents get a "wrap up" warning before hard abort, producing clean partial results instead of cut-off output
 - **Case-insensitive agent types** — `"explore"`, `"Explore"`, `"EXPLORE"` all work. Unknown types fall back to general-purpose with a note
@@ -330,6 +331,18 @@ Send a steering message to a running agent. The message interrupts after the cur
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
+
+### `mailbox`
+
+Exchange asynchronous messages with a direct parent or direct child. Sender identity comes from trusted session lineage; sibling, cross-tree, and multi-level access is rejected.
+
+```ts
+mailbox({ operation: { kind: "send", to_agent_id: "agent-id", message: "status update" } })
+mailbox({ operation: { kind: "receive", limit: 20 } })
+mailbox({ operation: { kind: "ack", message_ids: ["message-id"] } })
+```
+
+`receive` peeks at unacknowledged messages (default 20, maximum 100), so delivery is at least once until `ack`. A message is limited to 16 KiB UTF-8. Acknowledged messages remain stored; the extension does not automatically clean mailbox history. Mail for durable Agents shares their atomic session index and survives restart. Mail for `session_persistence: "memory"` Agents is process-only.
 
 ## Commands
 

@@ -8,6 +8,7 @@ import {
   LINEAGE_ENTRY_TYPE,
   normalizeMaxTreeLevels,
   resolveSessionLineage,
+  validateRestoredDirectChild,
 } from "../src/lineage.js";
 
 describe("Agent tree lineage", () => {
@@ -68,6 +69,35 @@ describe("Agent tree lineage", () => {
       depth: 2,
       maxTreeLevels: 3,
     });
+  });
+
+  it("fail-closes restored records unless they are exact direct children", () => {
+    const current = { agentId: "parent", rootAgentId: "root", parentAgentId: "root", depth: 1, maxTreeLevels: 4 };
+    const valid = {
+      id: "child",
+      lineage: { agentId: "child", parentAgentId: "parent", rootAgentId: "root", depth: 2, maxTreeLevels: 4 },
+    };
+    expect(validateRestoredDirectChild(valid, current)).toEqual({ ok: true });
+    // A child freezes the tree limit it was created with; changing the root setting
+    // later must not make an otherwise valid durable session unrestorable.
+    expect(validateRestoredDirectChild({
+      ...valid,
+      lineage: { ...valid.lineage, maxTreeLevels: 3 },
+    }, current)).toEqual({ ok: true });
+
+    const invalid = [
+      { ...valid, id: "other" },
+      { ...valid, lineage: { ...valid.lineage, agentId: "" } },
+      { ...valid, lineage: { ...valid.lineage, parentAgentId: "" } },
+      { ...valid, lineage: { ...valid.lineage, rootAgentId: "" } },
+      { ...valid, lineage: { ...valid.lineage, parentAgentId: "sibling" } },
+      { ...valid, lineage: { ...valid.lineage, rootAgentId: "other-root" } },
+      { ...valid, lineage: { ...valid.lineage, depth: 3 } },
+      { ...valid, lineage: { ...valid.lineage, maxTreeLevels: 99 } },
+    ];
+    for (const record of invalid) {
+      expect(validateRestoredDirectChild(record, current)).toMatchObject({ ok: false });
+    }
   });
 
   it("persists lineage as a Pi custom session entry", () => {

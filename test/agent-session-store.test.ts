@@ -87,14 +87,34 @@ describe("AgentSessionStore", () => {
     dirs.push(agentDir);
     const firstPath = resolveDurableAgentSessionStorePath(agentDir, "/repo", "parent-1")!;
     const secondPath = resolveDurableAgentSessionStorePath(agentDir, "/repo", "parent-2")!;
-    new AgentSessionStore(firstPath).upsert(record({ id: "other" }));
-    new AgentSessionStore(secondPath).upsert(record({ id: "target" }));
+    new AgentSessionStore(firstPath).upsert(record({
+      id: "other",
+      lineage: { ...record().lineage, agentId: "other" },
+    }));
+    new AgentSessionStore(secondPath).upsert(record({
+      id: "target",
+      lineage: { ...record().lineage, agentId: "target" },
+    }));
 
     expect(findPersistedAgentRecord(agentDir, "/repo", "target")).toMatchObject({
       storePath: secondPath,
       record: { id: "target", sessionFile: "/sessions/child.jsonl" },
     });
     expect(findPersistedAgentRecord(agentDir, "/different-repo", "target")).toBeUndefined();
+  });
+
+  it("rejects self-inconsistent persisted lineage before cross-session lookup", () => {
+    const agentDir = mkdtempSync(join(tmpdir(), "pi-agent-dir-"));
+    dirs.push(agentDir);
+    const path = resolveDurableAgentSessionStorePath(agentDir, "/repo", "parent-poisoned")!;
+    new AgentSessionStore(path).upsert(record());
+    const data = JSON.parse(readFileSync(path, "utf-8"));
+    data.agents[0].id = "forged-id";
+    writeFileSync(path, JSON.stringify(data), "utf-8");
+
+    const lookup = lookupPersistedAgentRecord(agentDir, "/repo", "forged-id");
+    expect(lookup.match).toBeUndefined();
+    expect(lookup.issues).toEqual([expect.objectContaining({ kind: "corrupt-index", path })]);
   });
 
   it("reports corrupt indexes and never overwrites them during a mutation", () => {

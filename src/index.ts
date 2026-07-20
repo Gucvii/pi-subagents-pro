@@ -5,6 +5,7 @@
  *   Agent             — LLM-callable: spawn a sub-agent
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   mailbox              — LLM-callable: exchange asynchronous direct-relation messages
  *
  * Commands:
  *   /agents                 — Interactive agent management menu
@@ -24,14 +25,15 @@ import { loadCustomAgents } from "./custom-agents.js";
 import { isModelInScope, readEnabledModels, resolveEnabledModels } from "./enabled-models.js";
 import { GroupJoinManager } from "./group-join.js";
 import { resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
-import { resolveSessionLineage } from "./lineage.js";
+import { resolveSessionLineage, validateRestoredDirectChild } from "./lineage.js";
+import { formatMailboxMessage, MailboxService, mailboxToolParameters } from "./mailbox.js";
 import { resolveExactModel } from "./model-resolver.js";
 import { createOutputFilePath, streamToOutputFile, writeInitialEntry } from "./output-file.js";
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getStatusNote } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type WidgetMode } from "./types.js";
+import { type AgentConfig, type AgentInvocation, type AgentRecord, type JoinMode, type NotificationDetails, type PersistedAgentRecord, type SubagentType, type WidgetMode } from "./types.js";
 import {
   type AgentActivity,
   type AgentDetails,
@@ -477,6 +479,54 @@ export default function (pi: ExtensionAPI) {
     }
     return store;
   };
+  const mailboxService = new MailboxService(getAgentSessionStore);
+  // Only depth-0 activations own root-tree process registry lifecycle. Keep every
+  // switched session alive until shutdown so background Agents remain mailbox-capable.
+  // Dynamically loaded child extension instances never add an entry here.
+  const ownedMailboxRootIds = new Set<string>();
+  let mailboxActivationClosed = false;
+
+  const registerPersistedMailboxRelation = (
+    record: PersistedAgentRecord,
+    childStorePath: string,
+    projectCwd: string,
+  ): void => {
+    mailboxService.registerParticipant({
+      lineage: record.lineage,
+      persistence: "durable",
+      storePath: childStorePath,
+    });
+
+    const child = record.lineage;
+    if (child.depth === 1) {
+      mailboxService.registerParticipant({
+        lineage: {
+          agentId: child.rootAgentId,
+          rootAgentId: child.rootAgentId,
+          depth: 0,
+          maxTreeLevels: child.maxTreeLevels,
+        },
+        persistence: "durable",
+      });
+      return;
+    }
+
+    if (!child.parentAgentId) return;
+    const parentLookup = lookupPersistedAgentRecord(getAgentDir(), projectCwd, child.parentAgentId);
+    const parent = parentLookup.match?.record;
+    if (
+      !parent
+      || parent.lineage.agentId !== child.parentAgentId
+      || parent.lineage.rootAgentId !== child.rootAgentId
+      || parent.lineage.depth !== child.depth - 1
+      || parent.lineage.maxTreeLevels !== child.maxTreeLevels
+    ) return;
+    mailboxService.registerParticipant({
+      lineage: parent.lineage,
+      persistence: "durable",
+      storePath: parentLookup.match?.storePath,
+    });
+  };
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
@@ -542,15 +592,26 @@ export default function (pi: ExtensionAPI) {
       compactionCount: record.compactionCount,
     });
   }, undefined, (record) => {
-    if (record.invocation?.sessionPersistence === "memory") return;
     const parentSession = (record.parentSessionId ? parentSessionsById.get(record.parentSessionId) : undefined)
       ?? parentSessionsByRoot.get(record.lineage.rootAgentId);
-    const storePath = resolveDurableAgentSessionStorePath(
-      getAgentDir(),
-      record.parentCwd,
-      record.parentSessionId,
-    ) ?? resolveAgentSessionStorePathFromParts(record.parentSessionDir, record.parentSessionId)
-      ?? resolveAgentSessionStorePath(parentSession);
+    const storePath = record.invocation?.sessionPersistence === "memory"
+      ? undefined
+      : resolveDurableAgentSessionStorePath(
+          getAgentDir(),
+          record.parentCwd,
+          record.parentSessionId,
+        ) ?? resolveAgentSessionStorePathFromParts(record.parentSessionDir, record.parentSessionId)
+          ?? resolveAgentSessionStorePath(parentSession);
+    // A late completion from an activation that is shutting down may still persist
+    // its durable record, but must not resurrect process-only mailbox participants.
+    if (!mailboxActivationClosed && mailboxService.hasParticipant(record.lineage.rootAgentId)) {
+      mailboxService.registerParticipant({
+        lineage: record.lineage,
+        persistence: record.invocation?.sessionPersistence ?? "durable",
+        storePath,
+      });
+    }
+    if (record.invocation?.sessionPersistence === "memory") return;
     if (storePath) {
       record.parentSessionId ??= parentSession?.getSessionId?.();
       record.parentSessionDir ??= parentSession?.getSessionDir?.() || (() => {
@@ -567,6 +628,10 @@ export default function (pi: ExtensionAPI) {
           if (currentCtx?.hasUI) currentCtx.ui.notify(`${message}. Existing index was not modified.`, "warning");
         }
       }
+    }
+  }, (record) => {
+    if (record.invocation?.sessionPersistence === "memory") {
+      mailboxService.unregisterParticipant(record.lineage);
     }
   });
 
@@ -643,12 +708,22 @@ export default function (pi: ExtensionAPI) {
         ctx.cwd,
         ctx.sessionManager.getSessionId(),
       ) ?? resolveAgentSessionStorePath(ctx.sessionManager);
+      // Child identity/persistence is registered by its spawning parent. Do not let
+      // a child activation overwrite a memory edge with a durable default.
+      if (lineage.depth === 0) {
+        ownedMailboxRootIds.add(lineage.rootAgentId);
+        mailboxService.registerParticipant({ lineage, persistence: "durable" });
+      }
       if (storePath) {
         const store = getAgentSessionStore(storePath);
+        store.reload();
         const issue = store.getIssue();
         if (issue) {
           const label = issue.kind === "corrupt-index" ? "corrupt" : "unreadable";
-          const message = `Agent session index is ${label}: ${issue.path}. It was not modified.`;
+          const message = `Durable mailbox store is ${label}: ${issue.path} (${issue.message}). It was not modified.`;
+          // The current trusted caller must see the issue on receive/ack. A child
+          // participant is normally already registered by its spawning parent.
+          try { mailboxService.setParticipantIssue(lineage, message); } catch { /* no trusted participant to annotate */ }
           console.warn(`[pi-subagents] ${message} ${issue.message}`);
           if (ctx.hasUI) ctx.ui.notify(message, "warning");
         } else {
@@ -656,12 +731,25 @@ export default function (pi: ExtensionAPI) {
             const file = ctx.sessionManager.getSessionFile();
             return file ? dirname(file) : undefined;
           })();
-          const restored = manager.restorePersisted(store.list().map((record) => ({
-            ...record,
-            parentCwd: record.parentCwd ?? ctx.cwd,
-            parentSessionId: record.parentSessionId ?? ctx.sessionManager.getSessionId(),
-            parentSessionDir: record.parentSessionDir ?? parentSessionDir,
-          })));
+          const restoredRecords = store.list().flatMap((record) => {
+            const validation = validateRestoredDirectChild(record, lineage);
+            if (!validation.ok) {
+              const message = `Rejected invalid restored Agent record "${String(record.id)}": ${validation.reason}.`;
+              console.warn(`[pi-subagents] ${message}`);
+              if (ctx.hasUI) ctx.ui.notify(message, "warning");
+              return [];
+            }
+            return [{
+              ...record,
+              parentCwd: record.parentCwd ?? ctx.cwd,
+              parentSessionId: record.parentSessionId ?? ctx.sessionManager.getSessionId(),
+              parentSessionDir: record.parentSessionDir ?? parentSessionDir,
+            }];
+          });
+          const restored = manager.restorePersisted(restoredRecords);
+          for (const record of restoredRecords) {
+            registerPersistedMailboxRelation(record, storePath, ctx.cwd);
+          }
           if (restored > 0) {
             pi.events.emit("subagents:sessions_restored", { count: restored, rootAgentId: lineage.rootAgentId });
             widget.update();
@@ -692,11 +780,15 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     manager.clearCompleted(true);
     scheduler.stop();
+    // Do not unregister the old root here: its background Agents keep running and
+    // may enqueue durable mail while the user views another session.
   });
 
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    // Set this before aborting: abort/completion callbacks can run during shutdown.
+    mailboxActivationClosed = true;
     rpcHandle?.unsubSpawn();
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
@@ -713,6 +805,12 @@ export default function (pi: ExtensionAPI) {
     pendingNudges.clear();
     fleet.dispose();
     manager.dispose();
+    // Abort/dispose first: their callbacks may still touch mailbox registration.
+    // Child activations own no root IDs and therefore cannot clear a parent's tree.
+    for (const rootAgentId of ownedMailboxRootIds) {
+      mailboxService.unregisterRootTree(rootAgentId);
+    }
+    ownedMailboxRootIds.clear();
   });
 
   // Live widget: show running agents above editor.
@@ -888,6 +986,41 @@ export default function (pi: ExtensionAPI) {
     },
     (event, payload) => pi.events.emit(event, payload),
   );
+
+  // ---- mailbox tool ----
+
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.MAILBOX,
+    label: "Mailbox",
+    description: "Asynchronous mailbox between a session and its direct parent or direct children. Receive peeks until messages are acknowledged.",
+    promptSnippet: "Exchange asynchronous messages with direct parent or child agents",
+    parameters: mailboxToolParameters,
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      try {
+        const lineage = resolveSessionLineage(
+          ctx.sessionManager,
+          manager.getMaxTreeLevels(),
+          ctx.getSystemPrompt?.(),
+        );
+        if (params.operation.kind === "send") {
+          const message = mailboxService.send(lineage, params.operation.to_agent_id, params.operation.message);
+          return textResult(`Mailbox message sent.\n\n${formatMailboxMessage(message)}`);
+        }
+        if (params.operation.kind === "receive") {
+          const messages = mailboxService.receive(lineage, params.operation.limit);
+          if (messages.length === 0) return textResult("Mailbox is empty.");
+          return textResult(
+            `${messages.length} unacknowledged mailbox message${messages.length === 1 ? "" : "s"}:\n\n`
+            + messages.map(formatMailboxMessage).join("\n\n---\n\n"),
+          );
+        }
+        const matched = mailboxService.ack(lineage, params.operation.message_ids);
+        return textResult(`Mailbox acknowledgement complete. Matched ${matched} message${matched === 1 ? "" : "s"}.`);
+      } catch (error) {
+        return textResult(error instanceof Error ? error.message : String(error));
+      }
+    },
+  }));
 
   // ---- Agent tool ----
 
@@ -1275,11 +1408,16 @@ Terse command-style prompts produce shallow, generic work.
       const resolvedConfig = resolveAgentInvocationConfig(customConfig, params);
 
       let resumeRecord = params.resume ? manager.getRecord(params.resume) : undefined;
+      let resumeStorePath: string | undefined;
       let lookupIssues: ReturnType<typeof lookupPersistedAgentRecord>["issues"] = [];
+      if (params.resume && resumeRecord && resumeRecord.parentCwd !== ctx.cwd) {
+        return textResult(`Agent "${params.resume}" was not found in this project.`);
+      }
       if (params.resume && !resumeRecord) {
         const lookup = lookupPersistedAgentRecord(getAgentDir(), ctx.cwd, params.resume);
         lookupIssues = lookup.issues;
         if (lookup.match) {
+          resumeStorePath = lookup.match.storePath;
           getAgentSessionStore(lookup.match.storePath);
           manager.restorePersisted([lookup.match.record]);
           resumeRecord = manager.getRecord(params.resume);
@@ -1314,6 +1452,18 @@ Terse command-style prompts produce shallow, generic work.
             `Agent "${params.resume}" cannot be resumed: its durable session file ${reason}.\n\nFile:\n${inspection.path}\n\nThe Agent metadata and file were not modified.`,
           );
         }
+      }
+      if (
+        params.resume
+        && resumeRecord
+        && resumeRecord.invocation?.sessionPersistence !== "memory"
+      ) {
+        resumeStorePath ??= resolveDurableAgentSessionStorePath(
+          getAgentDir(),
+          resumeRecord.parentCwd,
+          resumeRecord.parentSessionId,
+        ) ?? resolveAgentSessionStorePathFromParts(resumeRecord.parentSessionDir, resumeRecord.parentSessionId);
+        if (resumeStorePath) registerPersistedMailboxRelation(resumeRecord, resumeStorePath, ctx.cwd);
       }
       const resumedModelName = resumeRecord?.invocation?.modelName ?? (resumeRecord?.session?.model
         ? `${resumeRecord.session.model.provider}/${resumeRecord.session.model.id}`
