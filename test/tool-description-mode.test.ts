@@ -139,6 +139,52 @@ describe("toolDescriptionMode", () => {
     })).toBe(false);
   });
 
+  it("registers closed inspection schemas accepted by TypeBox Value.Check", () => {
+    const tools = setup();
+    const inspect = tools.get("inspect_agent");
+    const readEntry = tools.get("read_agent_entry");
+    const inspectParameters = inspect.parameters;
+    const selectionVariants = inspectParameters.properties.entries.anyOf;
+
+    expect(inspect.description).toContain("Routine rule");
+    expect(readEntry.description).toContain("Do not use for routine health checks");
+    expect(inspectParameters.additionalProperties).toBe(false);
+    expect(selectionVariants).toHaveLength(2);
+    expect(selectionVariants.every((variant: { additionalProperties: boolean }) => variant.additionalProperties === false)).toBe(true);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1" })).toBe(true);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1", entries: { kind: "tail", limit: 20, types: ["error"] } })).toBe(true);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1", entries: { kind: "after", cursor: `e_${"a".repeat(24)}`, limit: 50 } })).toBe(true);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1", entries: { kind: "after", cursor: `e_${"a".repeat(25)}` } })).toBe(false);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1", entries: { kind: "tail", cursor: "not-allowed" } })).toBe(false);
+    expect(Value.Check(inspectParameters, { agent_id: "agent-1", entries: { kind: "tail", limit: 21 } })).toBe(false);
+    expect(readEntry.parameters.additionalProperties).toBe(false);
+    const validRef = `e_${"b".repeat(24)}`;
+    expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: validRef })).toBe(true);
+    expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: `${validRef}0` })).toBe(false);
+    expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: validRef, offset: -1 })).toBe(false);
+    expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: validRef, max_bytes: 16001 })).toBe(false);
+  });
+
+  it("wires both inspection tools to non-disclosing unknown-Agent errors", async () => {
+    const tools = setup();
+    const ctx = { cwd: tmpDir };
+    const inspectResult = await tools.get("inspect_agent").execute("call-1", { agent_id: "unknown" }, undefined, undefined, ctx);
+    const readResult = await tools.get("read_agent_entry").execute(
+      "call-2",
+      { agent_id: "unknown", ref: `e_${"0".repeat(24)}` },
+      undefined,
+      undefined,
+      ctx,
+    );
+
+    expect(JSON.parse(inspectResult.content[0].text)).toEqual({
+      error: { code: "not_found", message: "Agent was not found in this project." },
+    });
+    expect(JSON.parse(readResult.content[0].text)).toEqual({
+      error: { code: "not_found", message: "Agent was not found in this project." },
+    });
+  });
+
   it("defaults to the full description", () => {
     const tools = setup();
     const desc: string = tools.get("Agent").description;

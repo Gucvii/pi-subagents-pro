@@ -5,7 +5,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 
 ## Features
 
-- **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`, `mailbox`)
+- **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `inspect_agent`, `read_agent_entry`, `get_subagent_result`, `steer_subagent`, `mailbox`)
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
@@ -142,6 +142,12 @@ Individual agent results render Claude Code-style in the conversation:
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
 By default, every Agent is also a normal durable Pi session in Pi's session directory. A small Agent-ID index is stored at `<agentDir>/subagent-sessions/<project-hash>/<parent-session-id>.json`; reopening the parent restores its Agent list automatically, while `Agent({ operation: { kind: "resume", agent_id: "<id>", prompt: "..." } })` can locate the ID from any later parent session in the same project. Resume lazily opens the child JSONL with its original model, effort, lineage, conversation, and worktree policy. Runs interrupted by process exit remain resumable.
+
+### Low-token Agent observation
+
+`inspect_agent` returns a compact status envelope without result text, errors, prompts, message bodies, summaries, or previews. Routine rule: call it bare; stop immediately for a queued Agent, or for a running Agent when `error_available` is false. Request `tail` metadata only when status remains unclear. Metadata is bounded to mechanical facts such as role, byte count, content block types, tool names, and compaction token counts. Tail responses use `older_entries_omitted`; incremental `after` responses use `has_more`, and both return one continuation `cursor` without duplicate pagination fields. Each opaque ref is a 96-bit SHA-256 prefix over the complete `(session ID, entry ID)` pair; it exposes neither ID and therefore fails explicitly against a replaced or cloned session.
+
+`read_agent_entry` accepts one of those refs and returns only that canonical session-entry JSON, paged by UTF-8-safe byte ranges (4,000 bytes by default, 16,000 maximum). If a ref is already known, read it directly; otherwise use this tool only for error/blocker investigation or an explicit user request. `get_subagent_result` remains the compatibility path for complete results and verbose formatted conversations. Durable inspection uses bounded Buffer-based forward/reverse JSONL scans, rejects invalid UTF-8, partial final lines, and lines over 8 MiB without modifying the file, and never reads the `.output` transcript. Memory-Agent history disappears when its live process record is cleaned up.
 
 For a one-off child conversation, set `session_persistence: "memory"` on a spawn operation. The Agent remains usable in the current Pi process, but writes no child Session JSONL, durable Agent index, or `.output` transcript; its ID cannot be resumed after Pi exits. This setting governs extension-owned conversation state only — the Agent's tools can still modify project files.
 
@@ -312,6 +318,28 @@ Launch a sub-agent.
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"worktree"` | no | Run in an isolated git worktree |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
+
+### `inspect_agent`
+
+Return compact Agent status without result/error/message bodies. Optionally request bounded entry metadata in the same call:
+
+```ts
+inspect_agent({ agent_id: "agent-id" })
+inspect_agent({ agent_id: "agent-id", entries: { kind: "tail", limit: 5, types: ["error"] } })
+inspect_agent({ agent_id: "agent-id", entries: { kind: "after", cursor: "e_...", limit: 10 } })
+```
+
+A bare call is the routine health/status path. Tail reports whether older matching entries were omitted; after reports whether a newer page remains. Both return `cursor` for future incremental observation.
+
+### `read_agent_entry`
+
+Read exactly one canonical session entry selected by an opaque `inspect_agent` ref:
+
+```ts
+read_agent_entry({ agent_id: "agent-id", ref: "e_...", max_bytes: 4000 })
+```
+
+Use only for a known relevant ref, an error/blocker investigation, or an explicit request. UTF-8-safe pagination uses `next_offset` when the entry exceeds the byte budget.
 
 ### `get_subagent_result`
 

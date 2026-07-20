@@ -3,6 +3,8 @@
  *
  * Tools:
  *   Agent             — LLM-callable: spawn a sub-agent
+ *   inspect_agent        — LLM-callable: compact status and entry metadata
+ *   read_agent_entry     — LLM-callable: read one canonical session entry by ref
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
  *   mailbox              — LLM-callable: exchange asynchronous direct-relation messages
@@ -16,6 +18,7 @@ import { dirname, join } from "node:path";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { ENTRY_TYPES, type EntrySelection, inspectAgentRecord, readAgentEntry } from "./agent-inspection.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
 import { AgentSessionStore, inspectAgentSessionFile, lookupPersistedAgentRecord, resolveAgentSessionStorePath, resolveAgentSessionStorePathFromParts, resolveDurableAgentSessionStorePath } from "./agent-session-store.js";
@@ -151,6 +154,7 @@ function formatLifetimeTokens(o: { lifetimeUsage: LifetimeUsage }): string {
 function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
   const state: AgentActivity = {
     activeTools: new Map(),
+    lastActivityAt: Date.now(),
     toolUses: 0,
     turnCount: 1,
     maxTurns,
@@ -161,6 +165,7 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
 
   const callbacks = {
     onToolActivity: (activity: { type: "start" | "end"; toolName: string }) => {
+      state.lastActivityAt = Date.now();
       if (activity.type === "start") {
         state.activeTools.set(activity.toolName + "_" + Date.now(), activity.toolName);
       } else {
@@ -172,10 +177,12 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
       onStreamUpdate?.();
     },
     onTextDelta: (_delta: string, fullText: string) => {
+      state.lastActivityAt = Date.now();
       state.responseText = fullText;
       onStreamUpdate?.();
     },
     onTurnEnd: (turnCount: number) => {
+      state.lastActivityAt = Date.now();
       state.turnCount = turnCount;
       onStreamUpdate?.();
     },
@@ -1834,6 +1841,125 @@ Terse command-style prompts produce shallow, generic work.
         (record.result?.trim() || "No output."),
         details,
       );
+    },
+  }));
+
+  // ---- low-token Agent inspection tools ----
+
+  const inspectionEntryTypeSchema = Type.Union(
+    ENTRY_TYPES.map((entryType) => Type.Literal(entryType)),
+    { description: "Entry metadata types. error also matches assistant/tool failures without changing the primary type." },
+  );
+  const inspectionTypesSchema = Type.Optional(Type.Array(inspectionEntryTypeSchema));
+  const tailSelectionSchema = Type.Object({
+    kind: Type.Literal("tail"),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20, description: "Maximum metadata entries. Default: 1." })),
+    types: inspectionTypesSchema,
+  }, { additionalProperties: false });
+  const afterSelectionSchema = Type.Object({
+    kind: Type.Literal("after"),
+    cursor: Type.String({
+      minLength: 26,
+      maxLength: 26,
+      pattern: "^e_[a-f0-9]{24}$",
+      description: "Opaque cursor previously returned for this Agent session.",
+    }),
+    limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Maximum metadata entries. Default: 1." })),
+    types: inspectionTypesSchema,
+  }, { additionalProperties: false });
+
+  const resolveInspectionRecord = (agentId: string, ctx: ExtensionContext): {
+    record?: AgentRecord | PersistedAgentRecord;
+    issues: ReturnType<typeof lookupPersistedAgentRecord>["issues"];
+  } => {
+    const live = manager.getRecord(agentId);
+    if (live) return live.parentCwd === ctx.cwd ? { record: live, issues: [] } : { issues: [] };
+    const lookup = lookupPersistedAgentRecord(getAgentDir(), ctx.cwd, agentId);
+    const persisted = lookup.match?.record;
+    if (!persisted) return { issues: lookup.issues };
+    const caller = resolveSessionLineage(
+      ctx.sessionManager,
+      manager.getMaxTreeLevels(),
+      ctx.getSystemPrompt?.(),
+    );
+    const isDirectChild = persisted.lineage.rootAgentId === caller.rootAgentId
+      && persisted.lineage.parentAgentId === caller.agentId
+      && persisted.lineage.depth === caller.depth + 1;
+    return isDirectChild ? { record: persisted, issues: lookup.issues } : { issues: [] };
+  };
+
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.INSPECT,
+    label: "Inspect Agent",
+    description:
+      "Low-token Agent observation without message bodies. Routine rule: call bare; stop immediately for queued Agents, or running Agents with error_available=false. Use tail only when status is unclear. Use read_agent_entry only for a known ref, error/blocker investigation, or an explicit user request; if a ref is already known, read it directly.",
+    promptSnippet: "Routine: bare inspect; stop for queued or running with no Agent error; tail only if unclear; read only a known ref/error/blocker/user request",
+    parameters: Type.Object({
+      agent_id: Type.String({ description: "Agent ID to inspect." }),
+      entries: Type.Optional(Type.Union([tailSelectionSchema, afterSelectionSchema], {
+        description: "Optionally return bounded entry metadata together with status.",
+      })),
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const resolved = resolveInspectionRecord(params.agent_id, ctx);
+      if (!resolved.record) {
+        if (resolved.issues.length > 0) {
+          return textResult(JSON.stringify({
+            error: {
+              code: "index_unavailable",
+              message: "Agent was not found, but one or more same-project Agent indexes could not be inspected. No files were modified.",
+              issues: resolved.issues.map((issue) => ({ kind: issue.kind })),
+            },
+          }));
+        }
+        return textResult(JSON.stringify({ error: { code: "not_found", message: "Agent was not found in this project." } }));
+      }
+      const result = await inspectAgentRecord(
+        resolved.record,
+        agentActivity.get(params.agent_id),
+        params.entries as EntrySelection | undefined,
+      );
+      return textResult(JSON.stringify(result));
+    },
+  }));
+
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.READ_ENTRY,
+    label: "Read Agent Entry",
+    description:
+      "Read one canonical Agent session entry by an explicit inspect_agent ref, with UTF-8-safe byte ranges. Do not use for routine health checks; use only for a known relevant ref, error/blocker investigation, or an explicit user request.",
+    promptSnippet: "Read one known Agent entry ref; never use as a routine health check",
+    parameters: Type.Object({
+      agent_id: Type.String({ description: "Agent ID owning the entry." }),
+      ref: Type.String({
+        minLength: 26,
+        maxLength: 26,
+        pattern: "^e_[a-f0-9]{24}$",
+        description: "Exact opaque entry ref returned by inspect_agent.",
+      }),
+      offset: Type.Optional(Type.Integer({ minimum: 0, description: "UTF-8 byte offset. Default: 0." })),
+      max_bytes: Type.Optional(Type.Integer({ minimum: 1, maximum: 16000, description: "Maximum bytes to return. Default: 4000." })),
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      const resolved = resolveInspectionRecord(params.agent_id, ctx);
+      if (!resolved.record) {
+        if (resolved.issues.length > 0) {
+          return textResult(JSON.stringify({
+            error: {
+              code: "index_unavailable",
+              message: "Agent was not found, but one or more same-project Agent indexes could not be inspected. No files were modified.",
+              issues: resolved.issues.map((issue) => ({ kind: issue.kind })),
+            },
+          }));
+        }
+        return textResult(JSON.stringify({ error: { code: "not_found", message: "Agent was not found in this project." } }));
+      }
+      return textResult(JSON.stringify(await readAgentEntry(
+        resolved.record,
+        params.ref,
+        params.offset,
+        params.max_bytes,
+      )));
     },
   }));
 

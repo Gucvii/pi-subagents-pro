@@ -38,6 +38,8 @@ import type { AgentLineage, SubagentType, ThinkingLevel } from "./types.js";
 export const SUBAGENT_TOOL_NAMES = {
   AGENT: "Agent",
   GET_RESULT: "get_subagent_result",
+  INSPECT: "inspect_agent",
+  READ_ENTRY: "read_agent_entry",
   STEER: "steer_subagent",
   MAILBOX: MAILBOX_TOOL_NAME,
 } as const;
@@ -46,6 +48,8 @@ export const SUBAGENT_TOOL_NAMES = {
 const RECURSIVE_TOOL_NAMES: string[] = [
   SUBAGENT_TOOL_NAMES.AGENT,
   SUBAGENT_TOOL_NAMES.GET_RESULT,
+  SUBAGENT_TOOL_NAMES.INSPECT,
+  SUBAGENT_TOOL_NAMES.READ_ENTRY,
   SUBAGENT_TOOL_NAMES.STEER,
 ];
 const THIS_MODULE_PATH = fileURLToPath(import.meta.url);

@@ -856,7 +856,7 @@ describe("agent-runner master tool allowlist", () => {
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
     withExtensions({
-      "/ext/subagents.ts": ["Agent", "get_subagent_result", "steer_subagent", "mailbox", "ok_ext"],
+      "/ext/subagents.ts": ["Agent", "get_subagent_result", "inspect_agent", "read_agent_entry", "steer_subagent", "mailbox", "ok_ext"],
     });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
@@ -866,6 +866,8 @@ describe("agent-runner master tool allowlist", () => {
     const tools = lastToolsPassed();
     expect(tools).not.toContain("Agent");
     expect(tools).not.toContain("get_subagent_result");
+    expect(tools).not.toContain("inspect_agent");
+    expect(tools).not.toContain("read_agent_entry");
     expect(tools).not.toContain("steer_subagent");
     expect(tools).not.toContain("mailbox");
     expect(tools).toContain("ok_ext");
@@ -875,7 +877,7 @@ describe("agent-runner master tool allowlist", () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
-    withExtensions({ "/ext/subagents.ts": ["Agent", "get_subagent_result", "steer_subagent", "mailbox"] });
+    withExtensions({ "/ext/subagents.ts": ["Agent", "get_subagent_result", "inspect_agent", "read_agent_entry", "steer_subagent", "mailbox"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 
@@ -884,14 +886,21 @@ describe("agent-runner master tool allowlist", () => {
       lineage: { agentId: "child", parentAgentId: "root", rootAgentId: "root", depth: 1, maxTreeLevels: 3 },
     });
 
-    expect(lastToolsPassed()).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent", "mailbox"]));
+    expect(lastToolsPassed()).toEqual(expect.arrayContaining([
+      "Agent",
+      "get_subagent_result",
+      "inspect_agent",
+      "read_agent_entry",
+      "steer_subagent",
+      "mailbox",
+    ]));
   });
 
   it("withholds recursive tools but keeps mailbox at the maximum tree level", async () => {
     vi.mocked(getConfig).mockReturnValueOnce(makeConfig({ extensions: true }));
     vi.mocked(getAgentConfig).mockReturnValueOnce(makeAgentConfig({ extensions: true }));
     vi.mocked(getToolNamesForType).mockReturnValueOnce(BUILTINS_7);
-    withExtensions({ "/ext/subagents.ts": ["Agent", "get_subagent_result", "steer_subagent", "mailbox"] });
+    withExtensions({ "/ext/subagents.ts": ["Agent", "get_subagent_result", "inspect_agent", "read_agent_entry", "steer_subagent", "mailbox"] });
     const { session } = createSession("OK");
     createAgentSession.mockResolvedValue({ session });
 
@@ -902,6 +911,8 @@ describe("agent-runner master tool allowlist", () => {
 
     expect(lastToolsPassed()).not.toContain("Agent");
     expect(lastToolsPassed()).not.toContain("get_subagent_result");
+    expect(lastToolsPassed()).not.toContain("inspect_agent");
+    expect(lastToolsPassed()).not.toContain("read_agent_entry");
     expect(lastToolsPassed()).not.toContain("steer_subagent");
     expect(lastToolsPassed()).toContain("mailbox");
   });

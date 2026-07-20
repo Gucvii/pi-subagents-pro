@@ -55,6 +55,8 @@ export type UICtx = {
 /** Per-agent live activity state. */
 export interface AgentActivity {
   activeTools: Map<string, string>;
+  /** Last live tool, text, or turn activity timestamp. */
+  lastActivityAt?: number;
   toolUses: number;
   responseText: string;
   session?: SessionLike;
