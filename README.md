@@ -48,9 +48,12 @@ The parent agent spawns sub-agents using the `Agent` tool:
 
 ```
 Agent({
-  subagent_type: "Explore",
-  prompt: "Find all files that handle authentication",
-  run_in_background: true,
+  operation: {
+    kind: "spawn",
+    subagent_type: "Explore",
+    prompt: "Find all files that handle authentication",
+    run_in_background: true,
+  },
 })
 ```
 
@@ -58,13 +61,16 @@ Foreground agents block until complete and return results inline. Background age
 
 ### Scheduling
 
-Add a `schedule` field to register the agent to fire later instead of running now:
+Use the `schedule` operation to register a future run instead of executing now:
 
 ```
 Agent({
-  subagent_type: "Explore",
-  prompt: "Look at recent commits and summarize what changed since last week",
-  schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
+  operation: {
+    kind: "schedule",
+    subagent_type: "Explore",
+    prompt: "Look at recent commits and summarize what changed since last week",
+    schedule: "0 0 9 * * 1",   // 9am every Monday (6-field cron)
+  },
 })
 ```
 
@@ -134,7 +140,7 @@ Individual agent results render Claude Code-style in the conversation:
 
 Completed results can be expanded (ctrl+o in pi) to show the full agent output inline.
 
-By default, every Agent is also a normal durable Pi session in Pi's session directory. A small Agent-ID index is stored at `<agentDir>/subagent-sessions/<project-hash>/<parent-session-id>.json`; reopening the parent session restores its Agent list automatically, while an explicit `Agent({ resume: "<id>", prompt: "..." })` can locate the ID from any later parent session in the same project. Resume lazily opens the child JSONL with its original model, effort, lineage, conversation, and worktree policy. Runs interrupted by a process exit are marked stopped but remain resumable. Set `persist_session: false` only when a custom agent must be memory-only.
+By default, every Agent is also a normal durable Pi session in Pi's session directory. A small Agent-ID index is stored at `<agentDir>/subagent-sessions/<project-hash>/<parent-session-id>.json`; reopening the parent restores its Agent list automatically, while `Agent({ operation: { kind: "resume", agent_id: "<id>", prompt: "..." } })` can locate the ID from any later parent session in the same project. Resume lazily opens the child JSONL with its original model, effort, lineage, conversation, and worktree policy. Runs interrupted by process exit remain resumable. Set `persist_session: false` only for an explicitly memory-only custom agent.
 
 Separately, foreground and background agents stream a convenience `.output` transcript to `<os-tmpdir>/pi-subagents-<uid>/<cwd>/<session>/tasks/<agent-id>.output` (owner-only `0700`, cleared on reboot). Set `output_transcript: false` on a custom agent to suppress it, or set `outputTranscript: false` in `subagents.json` project-wide. This transcript is independent of the durable Pi session, `isolation: worktree`, and `memory:`. Background completion notifications render as styled boxes:
 
@@ -195,11 +201,14 @@ Then spawn it like any built-in type:
 
 ```
 Agent({
-  subagent_type: "auditor",
-  prompt: "Review the auth module",
-  description: "Security audit",
-  model: "anthropic/claude-opus-4-6",
-  thinking: "high"
+  operation: {
+    kind: "spawn",
+    subagent_type: "auditor",
+    prompt: "Review the auth module",
+    description: "Security audit",
+    model: "anthropic/claude-opus-4-6",
+    thinking: "high",
+  },
 })
 ```
 
@@ -545,7 +554,7 @@ The `disallowed_tools` field is respected when determining write capability — 
 Set `isolation: worktree` to run an agent in a temporary git worktree:
 
 ```
-Agent({ subagent_type: "refactor", prompt: "...", isolation: "worktree" })
+Agent({ operation: { kind: "spawn", subagent_type: "refactor", prompt: "...", isolation: "worktree" } })
 ```
 
 The agent gets a full, isolated copy of the repository. On completion:

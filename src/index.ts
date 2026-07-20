@@ -866,53 +866,43 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Agent tool ----
 
-  // Schedule param + its guideline are gated on `schedulingEnabled` (read once
-  // at registration; flipping the setting later requires next pi session for
-  // the schema to update). Defining the shape once and spreading it via Partial
-  // preserves Type.Object's inference when present and produces a
-  // `schedule`-free schema when absent — zero LLM-context cost in disabled mode.
-  const scheduleParamShape = {
-    schedule: Type.Optional(
-      Type.String({
-        description:
-          'Opt-in only — fire later instead of now. Omit to run immediately (the default, almost always correct). ' +
-          'Formats: 6-field cron ("0 0 9 * * 1" = 9am Mon), interval ("5m"/"1h"), one-shot ("+10m" or ISO). ' +
-          'Forces run_in_background; incompatible with inherit_context and resume. Returns job ID.',
-      }),
-    ),
-  };
-  const scheduleParam: Partial<typeof scheduleParamShape> =
-    isSchedulingEnabled() ? scheduleParamShape : {};
+  // Scheduling is a distinct operation variant. The schema is fixed at registration;
+  // changing schedulingEnabled requires a reload so disabled sessions pay no schema cost.
+  const scheduleValueSchema = Type.String({
+    description:
+      'When to run: 6-field cron ("0 0 9 * * 1"), interval ("5m"/"1h"), one-shot ("+10m" or ISO).',
+  });
 
   const scheduleGuideline = isSchedulingEnabled()
-    ? `\n- Use \`schedule\` only when the user explicitly asked for scheduled / recurring / delayed execution (e.g. "every Monday", "in an hour"). Don't auto-schedule from vague intent like "monitor X" — run once now or ask.`
+    ? `\n- Use operation.kind="schedule" only when the user explicitly asked for scheduled / recurring / delayed execution. Don't auto-schedule from vague intent like "monitor X" — spawn once now or ask.`
     : "";
 
   // Compact Agent tool description (#91, `toolDescriptionMode: "compact"`) —
   // the same load-bearing facts as the full version at ~75% fewer tokens, for
   // small/local models. Per-option details live in the param descriptions.
-  const compactAgentToolDescription = `Launch an autonomous agent for complex, multi-step tasks. Agent types:
+  const compactAgentToolDescription = `Run exactly one Agent operation: spawn a new session, resume a durable session, or schedule a future run. Agent types:
 ${buildCompactTypeListText()}
 
 Custom agents: .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global).
 
 Notes:
-- description is optional UI metadata; when omitted it is derived from the prompt. Prompts must be self-contained — the agent has not seen this conversation.
-- model and thinking are optional; when omitted they inherit the main agent's current model and effort.
-- Parallel work: one message, multiple Agent calls, run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
+- Put all operation-specific fields inside operation. Use kind="spawn" with prompt + subagent_type, kind="resume" with agent_id + prompt, or kind="schedule" with schedule + prompt + subagent_type.
+- description is optional UI metadata for spawn/schedule; when omitted it is derived from the prompt. Spawn prompts must be self-contained.
+- model and thinking are optional for spawn/schedule; when omitted they inherit the main agent's current model and effort. Resume always reuses its original identity.
+- Parallel work: one message, multiple Agent calls with operation.run_in_background: true on each. You are notified when background agents finish — never poll or sleep.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID, including after restarting Pi when the parent session is reopened; steer_subagent messages a running one.
+- operation.kind="resume" continues a previous agent by ID, including after restarting Pi; steer_subagent messages a running one.
 - Nested delegation is bounded by maxTreeLevels (default 3, counting main as level 1). If Agent is available, delegate only when useful; maximum-level agents cannot spawn again.
 - isolation: "worktree" runs the agent in an isolated git worktree; changes land on a branch.`;
 
-  const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+  const fullAgentToolDescription = `Run exactly one Agent lifecycle operation: spawn a new session now, resume an existing durable session, or schedule a future run. Each agent type has specific capabilities and tools available to it.
 
 Available agent types and the tools they have access to:
 ${buildTypeListText()}
 
 Custom agents can be defined in .pi/agents/<name>.md (project) or ${getAgentDir()}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+Use the required \`operation\` object: \`kind: "spawn"\` requires \`prompt\` + \`subagent_type\`; \`kind: "resume"\` requires \`agent_id\` + \`prompt\`; \`kind: "schedule"\` requires \`schedule\` + \`prompt\` + \`subagent_type\`.
 
 ## When not to use
 
@@ -921,18 +911,18 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 ## Usage notes
 
 - A short description is useful UI metadata but optional; Agent derives one from the prompt when omitted.
-- When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
+- For parallel work, send multiple Agent calls in one message with \`operation.run_in_background: true\` on each. Foreground calls run sequentially.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
-- Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
-- Use resume with an agent ID to continue a previous agent's durable Pi session, including after restarting Pi and reopening the parent session. A new (non-resume) Agent call starts a fresh agent, so its prompt must still be self-contained.
+- Background completion is delivered automatically — do not poll or sleep waiting for it.
+- Foreground is the spawn default; scheduled jobs always run in background.
+- Use \`operation.kind: "resume"\` with \`agent_id\` to continue a durable session after restart. Spawn always starts a fresh session.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Omit model and thinking to inherit the main agent's current model and effort; specify exact values only when the child should differ.
+- Omit \`model\` and \`thinking\` on spawn/schedule to inherit the main identity. Resume always reuses its original identity.
 - Nested delegation is bounded by maxTreeLevels (default 3, counting the main agent as level 1). A maximum-level agent does not receive Agent tools; never try to bypass the limit.
-- Use inherit_context if the agent needs the parent conversation history.
+- Use \`operation.inherit_context\` on spawn when the child needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.${scheduleGuideline}
 
 ## Writing the prompt
@@ -998,6 +988,105 @@ Terse command-style prompts produce shallow, generic work.
   type AgentCallRenderState = { resolvedIdentity?: ResolvedCallIdentity };
   const agentCallIdentitySetters = new Map<string, (identity: ResolvedCallIdentity) => void>();
 
+  const promptSchema = Type.String({ description: "The task for the agent to perform." });
+  const descriptionSchema = Type.Optional(Type.String({
+    description: "Optional short description shown in UI. Derived from the prompt when omitted.",
+  }));
+  const agentTypeSchema = Type.String({
+    description: `Agent type. Available types: ${getAvailableTypes().join(", ")}. Custom agents come from .pi/agents/*.md or ${getAgentDir()}/agents/*.md.`,
+  });
+  const modelSchema = Type.Optional(Type.String({
+    description: 'Optional exact model override in "provider/modelId" form. Omit to inherit the agent definition or main agent.',
+    pattern: "^[^/\\s]+/[^/\\s]+$",
+  }));
+  const thinkingSchema = Type.Optional(Type.Union([
+    Type.Literal("off"),
+    Type.Literal("minimal"),
+    Type.Literal("low"),
+    Type.Literal("medium"),
+    Type.Literal("high"),
+    Type.Literal("xhigh"),
+    Type.Literal("max"),
+  ], { description: "Optional effort override. Omit to inherit the agent definition or main agent." }));
+  const maxTurnsSchema = Type.Optional(Type.Number({
+    description: "Maximum agentic turns before stopping. Omit for unlimited.",
+    minimum: 1,
+  }));
+  const isolatedSchema = Type.Optional(Type.Boolean({
+    description: "If true, the agent receives only built-in tools.",
+  }));
+  const worktreeSchema = Type.Optional(Type.Literal("worktree", {
+    description: "Run in a temporary Git worktree. Changes are saved to a branch on completion.",
+  }));
+
+  const spawnOperationSchema = Type.Object({
+    kind: Type.Literal("spawn", { description: "Create and run a new Agent session now." }),
+    prompt: promptSchema,
+    subagent_type: agentTypeSchema,
+    description: descriptionSchema,
+    model: modelSchema,
+    thinking: thinkingSchema,
+    max_turns: maxTurnsSchema,
+    run_in_background: Type.Optional(Type.Boolean({
+      description: "Run in background and return the stable Agent ID immediately.",
+    })),
+    isolated: isolatedSchema,
+    inherit_context: Type.Optional(Type.Boolean({
+      description: "Fork the parent conversation into the new Agent. Default: false.",
+    })),
+    isolation: worktreeSchema,
+  }, { additionalProperties: false, description: "Create a new Agent session." });
+
+  const resumeOperationSchema = Type.Object({
+    kind: Type.Literal("resume", { description: "Continue an existing durable Agent session." }),
+    agent_id: Type.String({ description: "Stable Agent ID to continue." }),
+    prompt: Type.String({ description: "New instruction appended to the existing Agent conversation." }),
+  }, { additionalProperties: false, description: "Resume an existing Agent session with its original identity and policy." });
+
+  const scheduleOperationSchema = Type.Object({
+    kind: Type.Literal("schedule", { description: "Create a future or recurring Agent job." }),
+    schedule: scheduleValueSchema,
+    prompt: promptSchema,
+    subagent_type: agentTypeSchema,
+    description: descriptionSchema,
+    model: modelSchema,
+    thinking: thinkingSchema,
+    max_turns: maxTurnsSchema,
+    isolated: isolatedSchema,
+    isolation: worktreeSchema,
+  }, { additionalProperties: false, description: "Schedule a new Agent run; execution is always background." });
+
+  const operationSchemas = isSchedulingEnabled()
+    ? [spawnOperationSchema, resumeOperationSchema, scheduleOperationSchema]
+    : [spawnOperationSchema, resumeOperationSchema];
+  const agentToolParameters = Type.Object({
+    operation: Type.Union(operationSchemas, {
+      description: "Exactly one operation: spawn a new Agent, resume an existing Agent, or schedule a future Agent.",
+    }),
+  }, { additionalProperties: false });
+
+  type NormalizedAgentParams = {
+    prompt: string;
+    description?: string;
+    subagent_type?: string;
+    model?: string;
+    thinking?: AgentInvocation["thinking"];
+    max_turns?: number;
+    run_in_background?: boolean;
+    resume?: string;
+    isolated?: boolean;
+    inherit_context?: boolean;
+    isolation?: "worktree";
+    schedule?: string;
+  };
+  const normalizeAgentParams = (raw: unknown): NormalizedAgentParams => {
+    const input = raw as { operation?: Record<string, unknown> } & Partial<NormalizedAgentParams>;
+    if (!input.operation) return input as NormalizedAgentParams; // compatibility for pre-split direct/RPC callers
+    const { kind, agent_id, ...rest } = input.operation;
+    if (kind === "resume") return { ...rest, resume: String(agent_id) } as NormalizedAgentParams;
+    return rest as NormalizedAgentParams;
+  };
+
   pi.registerTool(defineTool({
     name: SUBAGENT_TOOL_NAMES.AGENT,
     label: "Agent",
@@ -1005,82 +1094,17 @@ Terse command-style prompts produce shallow, generic work.
     promptSnippet: "Launch autonomous sub-agents for complex multi-step tasks",
     promptGuidelines: [
       "Use Agent with specialized agents when the task matches an agent type's description. Subagents are valuable for parallelizing independent queries or for protecting the main context window from excessive results, but should not be used excessively when not needed. Importantly, avoid duplicating work that subagents are already doing — if you delegate research to a subagent, do not also perform the same searches yourself.",
-      "For broad codebase exploration or research, spawn Agent with an appropriate subagent_type (e.g. Explore). Otherwise use direct tools (read, grep, find) when the target is already known.",
+      "For broad codebase exploration or research, use operation.kind=\"spawn\" with an appropriate operation.subagent_type (e.g. Explore). Otherwise use direct tools when the target is already known.",
       "When an agent runs in the background, you will be notified on completion — do not poll or sleep waiting for it. Continue with other work instead.",
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
       "Nested delegation is hard-bounded by maxTreeLevels (default 3, counting the main agent as level 1). Delegate only when it materially helps; maximum-level agents cannot spawn another generation.",
     ],
-    parameters: Type.Object({
-      prompt: Type.String({
-        description: "The task for the agent to perform.",
-      }),
-      description: Type.Optional(
-        Type.String({
-          description: "Optional short description shown in UI. Derived from the prompt when omitted.",
-        }),
-      ),
-      subagent_type: Type.Optional(
-        Type.String({
-          description: `Agent type for a new or scheduled run. Required unless resume is provided. Available types: ${getAvailableTypes().join(", ")}. Custom agents from .pi/agents/*.md (project) or ${getAgentDir()}/agents/*.md (global) are also available.`,
-        }),
-      ),
-      model: Type.Optional(
-        Type.String({
-          description:
-            'Optional exact model override in "provider/modelId" form. Omit to inherit the agent definition when pinned, otherwise the main agent model.',
-          pattern: "^[^/\\s]+/[^/\\s]+$",
-        }),
-      ),
-      thinking: Type.Optional(
-        Type.Union([
-          Type.Literal("off"),
-          Type.Literal("minimal"),
-          Type.Literal("low"),
-          Type.Literal("medium"),
-          Type.Literal("high"),
-          Type.Literal("xhigh"),
-          Type.Literal("max"),
-        ], {
-          description: "Optional effort override. Omit to inherit the agent definition when pinned, otherwise the main agent effort.",
-        }),
-      ),
-      max_turns: Type.Optional(
-        Type.Number({
-          description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
-          minimum: 1,
-        }),
-      ),
-      run_in_background: Type.Optional(
-        Type.Boolean({
-          description: "Set to true to run in background. Returns agent ID immediately. You will be notified on completion.",
-        }),
-      ),
-      resume: Type.Optional(
-        Type.String({
-          description: "Optional agent ID to resume from. Continues from previous context.",
-        }),
-      ),
-      isolated: Type.Optional(
-        Type.Boolean({
-          description: "If true, agent gets no extension/MCP tools — only built-in tools.",
-        }),
-      ),
-      inherit_context: Type.Optional(
-        Type.Boolean({
-          description: "If true, fork parent conversation into the agent. Default: false (fresh context).",
-        }),
-      ),
-      isolation: Type.Optional(
-        Type.Literal("worktree", {
-          description: 'Set to "worktree" to run the agent in a temporary git worktree (isolated copy of the repo). Changes are saved to a branch on completion.',
-        }),
-      ),
-      ...scheduleParam,
-    }),
+    parameters: agentToolParameters,
 
     // ---- Custom rendering: Claude Code style ----
 
-    renderCall(args, theme, context) {
+    renderCall(rawArgs, theme, context) {
+      const args = normalizeAgentParams(rawArgs);
       const rawType = args.subagent_type as SubagentType | undefined;
       const resolvedType = rawType ? (resolveType(rawType) ?? "general-purpose") : "general-purpose";
       const invocation = resolveAgentInvocationConfig(getAgentConfig(resolvedType), args);
@@ -1186,7 +1210,8 @@ Terse command-style prompts produce shallow, generic work.
 
     // ---- Execute ----
 
-    execute: async (toolCallId, params, signal, onUpdate, ctx) => {
+    execute: async (toolCallId, rawParams, signal, onUpdate, ctx) => {
+      const params = normalizeAgentParams(rawParams);
       // Ensure we have UI context for widget rendering
       widget.setUICtx(ctx.ui as UICtx);
 

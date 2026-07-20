@@ -164,8 +164,8 @@ export interface PrintModeRun {
 // --------------------------------------------------------------------------
 
 /**
- * Build an `Agent` tool call for a faux assistant turn. `subagent_type` defaults
- * to "general-purpose"; everything else is passed straight through as tool args.
+ * Build a schema-valid `spawn` operation for a faux Agent assistant turn.
+ * `subagent_type` defaults to "general-purpose".
  */
 export function agentCall(
   args: {
@@ -178,8 +178,11 @@ export function agentCall(
   opts?: { id?: string },
 ): ToolCall {
   return fauxToolCall("Agent", {
-    subagent_type: "general-purpose",
-    ...args,
+    operation: {
+      subagent_type: "general-purpose",
+      kind: "spawn",
+      ...args,
+    },
   }, opts);
 }
 

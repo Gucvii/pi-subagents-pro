@@ -7,6 +7,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Value } from "@sinclair/typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import subagentsExtension from "../src/index.js";
 
@@ -83,15 +84,49 @@ describe("toolDescriptionMode", () => {
     rmSync(hermeticAgentDir, { recursive: true, force: true });
   });
 
-  it("keeps execution identity and UI metadata optional in the Agent schema", () => {
+  it("exposes mutually exclusive spawn, resume, and schedule operation schemas", () => {
     const tools = setup();
     const parameters = tools.get("Agent").parameters;
+    const variants = parameters.properties.operation.anyOf;
+    const byKind = new Map(variants.map((variant: any) => [variant.properties.kind.const, variant]));
+    const spawn = byKind.get("spawn");
+    const resume = byKind.get("resume");
+    const schedule = byKind.get("schedule");
 
-    expect(parameters.required).toEqual(["prompt"]);
-    expect(parameters.properties.model.pattern).toBe("^[^/\\s]+/[^/\\s]+$");
-    expect(parameters.properties.thinking.anyOf.map((entry: { const: string }) => entry.const)).toEqual([
+    expect(parameters.required).toEqual(["operation"]);
+    expect(parameters.additionalProperties).toBe(false);
+    expect(spawn.required).toEqual(["kind", "prompt", "subagent_type"]);
+    expect(spawn.additionalProperties).toBe(false);
+    expect(spawn.properties.model.pattern).toBe("^[^/\\s]+/[^/\\s]+$");
+    expect(spawn.properties.thinking.anyOf.map((entry: { const: string }) => entry.const)).toEqual([
       "off", "minimal", "low", "medium", "high", "xhigh", "max",
     ]);
+    expect(resume.required).toEqual(["kind", "agent_id", "prompt"]);
+    expect(resume.additionalProperties).toBe(false);
+    expect(resume.properties).not.toHaveProperty("subagent_type");
+    expect(resume.properties).not.toHaveProperty("model");
+    expect(schedule.required).toEqual(["kind", "schedule", "prompt", "subagent_type"]);
+    expect(schedule.additionalProperties).toBe(false);
+    expect(schedule.properties).not.toHaveProperty("resume");
+    expect(schedule.properties).not.toHaveProperty("inherit_context");
+    expect(schedule.properties).not.toHaveProperty("run_in_background");
+
+    expect(Value.Check(parameters, {
+      operation: { kind: "spawn", prompt: "inspect", subagent_type: "Explore" },
+    })).toBe(true);
+    expect(Value.Check(parameters, {
+      operation: { kind: "resume", agent_id: "agent-1", prompt: "continue" },
+    })).toBe(true);
+    expect(Value.Check(parameters, {
+      operation: { kind: "schedule", schedule: "1h", prompt: "report", subagent_type: "general-purpose" },
+    })).toBe(true);
+    expect(Value.Check(parameters, { operation: { kind: "spawn", prompt: "missing type" } })).toBe(false);
+    expect(Value.Check(parameters, {
+      operation: { kind: "resume", agent_id: "agent-1", prompt: "continue", model: "test/model" },
+    })).toBe(false);
+    expect(Value.Check(parameters, {
+      operation: { kind: "schedule", schedule: "1h", prompt: "report", subagent_type: "general-purpose", inherit_context: true },
+    })).toBe(false);
   });
 
   it("defaults to the full description", () => {
@@ -106,7 +141,7 @@ describe("toolDescriptionMode", () => {
   it("compact mode swaps in the short description with one-line type list", () => {
     const tools = setup({ toolDescriptionMode: "compact" });
     const desc: string = tools.get("Agent").description;
-    expect(desc).toContain("Launch an autonomous agent");
+    expect(desc).toContain("Run exactly one Agent operation");
     expect(desc).not.toContain("## Usage notes");
     expect(desc).not.toContain("## Writing the prompt");
     // Type list keeps every agent but only the first sentence of each description.
@@ -114,7 +149,7 @@ describe("toolDescriptionMode", () => {
     expect(desc).toContain("- Explore: Fast read-only search agent for locating code. (Tools:");
     expect(desc).not.toContain("very thorough");
     // The point of the feature: materially smaller than the full version.
-    expect(desc.length).toBeLessThan(1600);
+    expect(desc.length).toBeLessThan(1900);
   });
 
   it("invalid mode in the settings file is dropped — full description", () => {
@@ -171,7 +206,7 @@ describe("toolDescriptionMode", () => {
     });
     const desc: string = tools.get("Agent").description;
     // The expansion carries its own leading "\n- " bullet.
-    expect(desc).toContain("RULES:\n- Use `schedule` only when");
+    expect(desc).toContain('RULES:\n- Use operation.kind="schedule" only when');
   });
 
   it("{{scheduleGuideline}} expands to the empty string when scheduling is disabled", () => {
@@ -181,6 +216,8 @@ describe("toolDescriptionMode", () => {
     const desc: string = tools.get("Agent").description;
     expect(desc).toContain("RULES:\nEND");
     expect(desc).not.toContain("schedule");
+    const variants = tools.get("Agent").parameters.properties.operation.anyOf;
+    expect(variants.map((variant: any) => variant.properties.kind.const)).toEqual(["spawn", "resume"]);
   });
 
   it("every documented placeholder is replaced — no {{ }} residue", () => {

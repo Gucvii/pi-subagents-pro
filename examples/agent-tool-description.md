@@ -1,11 +1,11 @@
-Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
+Run exactly one Agent lifecycle operation: spawn a new session now, resume an existing durable session, or schedule a future run. Each agent type has specific capabilities and tools available to it.
 
 Available agent types and the tools they have access to:
 {{typeList}}
 
 Custom agents can be defined in .pi/agents/<name>.md (project) or {{agentDir}}/agents/<name>.md (global) — they are picked up automatically. Project-level agents override global ones. Creating a .md file with the same name as a default agent overrides it.
 
-When using the Agent tool, specify a subagent_type parameter to select which agent type to use.
+Use the required `operation` object: `kind: "spawn"` requires `prompt` + `subagent_type`; `kind: "resume"` requires `agent_id` + `prompt`; `kind: "schedule"` requires `schedule` + `prompt` + `subagent_type`.
 
 ## When not to use
 
@@ -14,18 +14,18 @@ If the target is already known, use a direct tool — `read` for a known path, `
 ## Usage notes
 
 - A short description is useful UI metadata but optional; Agent derives one from the prompt when omitted.
-- When you launch multiple agents for independent work, send them in a single message with multiple tool uses, with run_in_background: true on each, so they run concurrently. If the user specifies that they want agents run "in parallel", you MUST send a single message with multiple tool calls. Foreground calls run sequentially — only one executes at a time.
+- For parallel work, send multiple Agent calls in one message with `operation.run_in_background: true` on each. Foreground calls run sequentially.
 - When the agent is done, it returns a single message back to you. The result is not visible to the user — to show the user, send a text message with a concise summary.
 - Trust but verify: an agent's summary describes what it intended to do, not necessarily what it did. When an agent writes or edits code, check the actual changes before reporting work as done.
-- Use run_in_background for work you don't need immediately. You will be notified when it completes — do NOT poll or sleep waiting for it. Continue with other work or respond to the user instead.
-- Foreground vs background: use foreground (default) when you need the agent's results before you can proceed. Use background when you have genuinely independent work to do in parallel.
-- Use resume with an agent ID to continue a previous agent's durable Pi session, including after restarting Pi and reopening the parent session. A new (non-resume) Agent call starts a fresh agent, so its prompt must still be self-contained.
+- Background completion is delivered automatically — do not poll or sleep waiting for it.
+- Foreground is the spawn default; scheduled jobs always run in background.
+- Use `operation.kind: "resume"` with `agent_id` to continue a durable session after restart. Spawn always starts a fresh session.
 - Use steer_subagent to send mid-run messages to a running background agent.
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
-- Omit model and thinking to inherit the main agent's current model and effort; specify exact values only when the child should differ.
+- Omit `model` and `thinking` on spawn/schedule to inherit the main identity. Resume always reuses its original identity.
 - Nested delegation is bounded by maxTreeLevels (default 3, counting the main agent as level 1). A maximum-level agent does not receive Agent tools; never try to bypass the limit.
-- Use inherit_context if the agent needs the parent conversation history.
+- Use `operation.inherit_context` on spawn when the child needs the parent conversation history.
 - Use isolation: "worktree" to run the agent in an isolated git worktree (safe parallel file modifications). The worktree is automatically cleaned up if the agent makes no changes; otherwise the path and branch are returned in the result.{{scheduleGuideline}}
 
 ## Writing the prompt
