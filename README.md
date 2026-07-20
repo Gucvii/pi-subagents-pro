@@ -5,7 +5,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 
 ## Features
 
-- **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `inspect_agent`, `read_agent_entry`, `get_subagent_result`, `steer_subagent`, `mailbox`)
+- **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `inspect_agent`, `read_agent_entry`, `get_subagent_result`, `steer_subagent`, `stop_agent`, `mailbox`)
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
@@ -147,7 +147,7 @@ By default, every Agent is also a normal durable Pi session in Pi's session dire
 
 `inspect_agent` returns a compact status envelope without result text, errors, prompts, message bodies, summaries, or previews. Routine rule: call it bare; stop immediately for a queued Agent, or for a running Agent when `error_available` is false. Request `tail` metadata only when status remains unclear. Metadata is bounded to mechanical facts such as role, byte count, content block types, tool names, and compaction token counts. Tail responses use `older_entries_omitted`; incremental `after` responses use `has_more`, and both return one continuation `cursor` without duplicate pagination fields. Each opaque ref is a 96-bit SHA-256 prefix over the complete `(session ID, entry ID)` pair; it exposes neither ID and therefore fails explicitly against a replaced or cloned session.
 
-`read_agent_entry` accepts one of those refs and returns only that canonical session-entry JSON, paged by UTF-8-safe byte ranges (4,000 bytes by default, 16,000 maximum). If a ref is already known, read it directly; otherwise use this tool only for error/blocker investigation or an explicit user request. `get_subagent_result` remains the compatibility path for complete results and verbose formatted conversations. Durable inspection uses bounded Buffer-based forward/reverse JSONL scans, rejects invalid UTF-8, partial final lines, and lines over 8 MiB without modifying the file, and never reads the `.output` transcript. Memory-Agent history disappears when its live process record is cleaned up.
+`read_agent_entry` accepts one of those refs and returns only that canonical session-entry JSON, paged by UTF-8-safe byte ranges (4,000 bytes by default, 16,000 maximum). Terminal error notifications include an `error_ref` when a canonical provider/tool error entry exists, so the parent can read it directly without first inspecting a tail. If a ref is already known, read it directly; otherwise use this tool only for error/blocker investigation or an explicit user request. `get_subagent_result` remains the compatibility path for complete results and verbose formatted conversations. Durable inspection uses bounded Buffer-based forward/reverse JSONL scans, rejects invalid UTF-8, partial final lines, and lines over 8 MiB without modifying the file, and never reads the `.output` transcript. Memory-Agent history disappears when its live process record is cleaned up.
 
 For a one-off child conversation, set `session_persistence: "memory"` on a spawn operation. The Agent remains usable in the current Pi process, but writes no child Session JSONL, durable Agent index, or `.output` transcript; its ID cannot be resumed after Pi exits. This setting governs extension-owned conversation state only — the Agent's tools can still modify project files.
 
@@ -359,6 +359,17 @@ Send a steering message to a running agent. The message interrupts after the cur
 |-----------|------|----------|-------------|
 | `agent_id` | string | yes | Agent ID to steer |
 | `message` | string | yes | Message to inject into agent conversation |
+
+### `stop_agent`
+
+Stop one direct child and unconditionally stop its entire active current-process subtree, deepest-first. Caller identity comes from trusted session lineage; sibling, ancestor, grandchild, cross-root, cross-project, and unknown IDs all receive the same non-disclosing error. There is no non-cascading mode.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `agent_id` | string | yes | Direct child Agent ID |
+| `reason` | string | no | Stop reason, maximum 500 UTF-8 bytes |
+
+The synchronous response reports `root_agent_id`, each queued/running member changed to `stopped` with its previous status and depth, optional per-node `stop_failures`, whether the target was already terminal, and the reason. It does not wait for an uncooperative provider/model to exit. Idempotent stop receipts are process-local and retained in a bounded 1,000-entry LRU retry window; they are not a durable state source.
 
 ### `mailbox`
 

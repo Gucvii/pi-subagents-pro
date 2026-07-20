@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Value } from "@sinclair/typebox/value";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { agentRuntimeTree } from "../src/agent-runtime-tree.js";
 import subagentsExtension from "../src/index.js";
 
 const EXAMPLE_TEMPLATE = fileURLToPath(new URL("../examples/agent-tool-description.md", import.meta.url));
@@ -74,6 +75,7 @@ describe("toolDescriptionMode", () => {
 
   afterEach(async () => {
     await shutdown?.();
+    agentRuntimeTree.resetForTests();
     shutdown = undefined;
     process.chdir(prevCwd);
     if (prevAgentDir == null) delete process.env.PI_CODING_AGENT_DIR;
@@ -143,6 +145,7 @@ describe("toolDescriptionMode", () => {
     const tools = setup();
     const inspect = tools.get("inspect_agent");
     const readEntry = tools.get("read_agent_entry");
+    const stop = tools.get("stop_agent");
     const inspectParameters = inspect.parameters;
     const selectionVariants = inspectParameters.properties.entries.anyOf;
 
@@ -163,6 +166,52 @@ describe("toolDescriptionMode", () => {
     expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: `${validRef}0` })).toBe(false);
     expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: validRef, offset: -1 })).toBe(false);
     expect(Value.Check(readEntry.parameters, { agent_id: "agent-1", ref: validRef, max_bytes: 16001 })).toBe(false);
+    expect(stop.description).toContain("always stop its entire");
+    expect(stop.parameters.additionalProperties).toBe(false);
+    expect(Value.Check(stop.parameters, { agent_id: "agent-1" })).toBe(true);
+    expect(Value.Check(stop.parameters, { agent_id: "agent-1", reason: "done" })).toBe(true);
+    expect(Value.Check(stop.parameters, { agent_id: "agent-1", cascade: false })).toBe(false);
+    expect(Value.Check(stop.parameters, { agent_id: "agent-1", reason: "x".repeat(501) })).toBe(false);
+  });
+
+  it("wires stop_agent to trusted direct-child cascade authorization", async () => {
+    const tools = setup();
+    const caller = { agentId: "root-session", rootAgentId: "root-session", depth: 0, maxTreeLevels: 3 };
+    const target = { agentId: "child-agent", parentAgentId: caller.agentId, rootAgentId: caller.rootAgentId, depth: 1, maxTreeLevels: 3 };
+    let status = "running" as const | "stopped";
+    agentRuntimeTree.register(target, tmpDir, {}, {
+      getStatus: () => status,
+      stop: () => { status = "stopped"; return true; },
+    });
+    const ctx = {
+      cwd: tmpDir,
+      sessionManager: { getSessionId: () => caller.agentId },
+      getSystemPrompt: () => "",
+    };
+    const result = await tools.get("stop_agent").execute(
+      "call-stop",
+      { agent_id: target.agentId, reason: "finished" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(JSON.parse(result.content[0].text)).toMatchObject({
+      root_agent_id: target.agentId,
+      stopped_agents: [{ agent_id: target.agentId, previous_status: "running", depth: 1 }],
+      already_terminal: false,
+      reason: "finished",
+    });
+
+    const denied = await tools.get("stop_agent").execute(
+      "call-denied",
+      { agent_id: "unknown" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(JSON.parse(denied.content[0].text)).toEqual({
+      error: { code: "not_found", message: "Agent was not found or is not authorized for this operation." },
+    });
   });
 
   it("wires both inspection tools to non-disclosing unknown-Agent errors", async () => {

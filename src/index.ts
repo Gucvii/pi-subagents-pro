@@ -7,6 +7,7 @@
  *   read_agent_entry     — LLM-callable: read one canonical session entry by ref
  *   get_subagent_result  — LLM-callable: check background agent status/result
  *   steer_subagent       — LLM-callable: send a steering message to a running agent
+ *   stop_agent           — LLM-callable: stop a direct child's full runtime subtree
  *   mailbox              — LLM-callable: exchange asynchronous direct-relation messages
  *
  * Commands:
@@ -21,6 +22,7 @@ import { Type } from "@sinclair/typebox";
 import { ENTRY_TYPES, type EntrySelection, inspectAgentRecord, readAgentEntry } from "./agent-inspection.js";
 import { AgentManager } from "./agent-manager.js";
 import { getAgentConversation, getDefaultMaxTurns, getGraceTurns, normalizeMaxTurns, SUBAGENT_TOOL_NAMES, setDefaultMaxTurns, setGraceTurns, steerAgent } from "./agent-runner.js";
+import { agentRuntimeTree } from "./agent-runtime-tree.js";
 import { AgentSessionStore, inspectAgentSessionFile, lookupPersistedAgentRecord, resolveAgentSessionStorePath, resolveAgentSessionStorePathFromParts, resolveDurableAgentSessionStorePath } from "./agent-session-store.js";
 import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, isDefaultsDisabled, registerAgents, resolveType, setDefaultsDisabled } from "./agent-types.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
@@ -246,6 +248,7 @@ export function formatTaskNotification(record: AgentRecord, resultMaxLen: number
     `<task-id>${record.id}</task-id>`,
     record.toolCallId ? `<tool-use-id>${escapeXml(record.toolCallId)}</tool-use-id>` : null,
     record.outputFile ? `<output-file>${escapeXml(record.outputFile)}</output-file>` : null,
+    record.errorRef ? `<error_ref>${escapeXml(record.errorRef)}</error_ref>` : null,
     `<status>${escapeXml(status)}</status>`,
     `<summary>Agent "${escapeXml(record.description)}" ${record.status}${getStatusNote(record.status)}</summary>`,
     modelXml,
@@ -294,6 +297,7 @@ export function buildNotificationDetails(record: AgentRecord, resultMaxLen: numb
     durationMs: record.completedAt ? record.completedAt - record.startedAt : 0,
     outputFile: record.outputFile,
     error: record.error,
+    errorRef: record.errorRef,
     resultPreview: record.result
       ? record.result.length > resultMaxLen
         ? record.result.slice(0, resultMaxLen) + "…"
@@ -345,6 +349,9 @@ export default function (pi: ExtensionAPI) {
         if (d.outputFile) {
           line += "\n  " + theme.fg("muted", `transcript: ${d.outputFile}`);
         }
+        if (d.errorRef) {
+          line += "\n  " + theme.fg("muted", `error_ref: ${d.errorRef}`);
+        }
 
         return line;
       }
@@ -373,9 +380,11 @@ export default function (pi: ExtensionAPI) {
   const NUDGE_HOLD_MS = 200;
 
   function scheduleNudge(key: string, send: () => void, delay = NUDGE_HOLD_MS) {
+    if (mailboxActivationClosed) return;
     cancelNudge(key);
     pendingNudges.set(key, setTimeout(() => {
       pendingNudges.delete(key);
+      if (mailboxActivationClosed) return;
       try { send(); } catch { /* ignore stale completion side-effect errors */ }
     }, delay));
   }
@@ -390,7 +399,7 @@ export default function (pi: ExtensionAPI) {
 
   // ---- Individual nudge helper (async join mode) ----
   function emitIndividualNudge(record: AgentRecord) {
-    if (record.resultConsumed) return;  // re-check at send time
+    if (mailboxActivationClosed || record.resultConsumed) return;  // re-check at send time
 
     const notification = formatTaskNotification(record, 500);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
@@ -404,6 +413,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function sendIndividualNudge(record: AgentRecord) {
+    if (mailboxActivationClosed) return;
     agentActivity.delete(record.id);
     widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
@@ -414,6 +424,7 @@ export default function (pi: ExtensionAPI) {
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
+      if (mailboxActivationClosed) return;
       for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
@@ -463,6 +474,7 @@ export default function (pi: ExtensionAPI) {
       description: record.description,
       result: record.result,
       error: record.error,
+      error_ref: record.errorRef,
       status: record.status,
       toolUses: record.toolUses,
       durationMs,
@@ -537,6 +549,7 @@ export default function (pi: ExtensionAPI) {
 
   // Background completion: route through group join or send individual nudge
   const manager = new AgentManager((record) => {
+    if (mailboxActivationClosed) return;
     // Emit lifecycle event based on terminal status
     const isError = record.status === "error" || record.status === "stopped" || record.status === "aborted";
     const eventData = buildEventData(record);
@@ -551,6 +564,7 @@ export default function (pi: ExtensionAPI) {
       pi.appendEntry("subagents:record", {
         id: record.id, type: record.type, description: record.description,
         status: record.status, result: record.result, error: record.error,
+        stopReason: record.stopReason, errorRef: record.errorRef,
         startedAt: record.startedAt, completedAt: record.completedAt,
         lineage: record.lineage, sessionFile: record.sessionFile,
         invocation: record.invocation,
@@ -581,6 +595,7 @@ export default function (pi: ExtensionAPI) {
     // 'delivered' → group callback already fired
     widget.update();
   }, undefined, (record) => {
+    if (mailboxActivationClosed) return;
     // Emit started event when agent transitions to running (including from queue)
     pi.events.emit("subagents:started", {
       id: record.id,
@@ -589,6 +604,7 @@ export default function (pi: ExtensionAPI) {
       lineage: record.lineage,
     });
   }, (record, info) => {
+    if (mailboxActivationClosed) return;
     // Emit compacted event when agent's session compacts (preserves count on record).
     pi.events.emit("subagents:compacted", {
       id: record.id,
@@ -632,11 +648,12 @@ export default function (pi: ExtensionAPI) {
         console.warn(`[pi-subagents] Failed to persist Agent "${record.id}": ${message}`);
         if (!reportedAgentStoreIssues.has(storePath)) {
           reportedAgentStoreIssues.add(storePath);
-          if (currentCtx?.hasUI) currentCtx.ui.notify(`${message}. Existing index was not modified.`, "warning");
+          if (!mailboxActivationClosed && currentCtx?.hasUI) currentCtx.ui.notify(`${message}. Existing index was not modified.`, "warning");
         }
       }
     }
   }, (record) => {
+    if (mailboxActivationClosed) return;
     if (record.invocation?.sessionPersistence === "memory") {
       mailboxService.unregisterParticipant(record.lineage);
     }
@@ -666,6 +683,7 @@ export default function (pi: ExtensionAPI) {
 
   // --- Cross-extension RPC via pi.events ---
   let currentCtx: ExtensionContext | undefined;
+  const activationLineages = new Map<string, { lineage: ReturnType<typeof resolveSessionLineage>; cwd: string }>();
   // RPC handlers + the `subagents:ready` broadcast are wired on `session_start`
   // (a bound lifecycle event), not at factory time. pi runs every extension
   // factory before the `extensions:` filter and only fires lifecycle events for
@@ -710,6 +728,7 @@ export default function (pi: ExtensionAPI) {
       );
       parentSessionsByRoot.set(lineage.rootAgentId, ctx.sessionManager);
       parentSessionsById.set(ctx.sessionManager.getSessionId(), ctx.sessionManager);
+      activationLineages.set(ctx.sessionManager.getSessionId(), { lineage, cwd: ctx.cwd });
       const storePath = resolveDurableAgentSessionStorePath(
         getAgentDir(),
         ctx.cwd,
@@ -800,6 +819,10 @@ export default function (pi: ExtensionAPI) {
     rpcHandle?.unsubStop();
     rpcHandle?.unsubPing();
     rpcHandle = undefined;
+    for (const activation of activationLineages.values()) {
+      agentRuntimeTree.stopChildren(activation.lineage, activation.cwd, "Parent Agent session shut down.");
+    }
+    activationLineages.clear();
     currentCtx = undefined;
     // Only release the global slot if this activation claimed it — a child
     // session's shutdown must not delete the root session's registry entry.
@@ -807,9 +830,12 @@ export default function (pi: ExtensionAPI) {
       delete (globalThis as any)[MANAGER_KEY];
     }
     scheduler.stop();
-    manager.abortAll();
+    manager.abortAll("Agent manager shut down.");
     for (const timer of pendingNudges.values()) clearTimeout(timer);
     pendingNudges.clear();
+    if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
+    batchFinalizeTimer = undefined;
+    currentBatchAgents = [];
     fleet.dispose();
     manager.dispose();
     // Abort/dispose first: their callbacks may still touch mailbox registration.
@@ -901,6 +927,10 @@ export default function (pi: ExtensionAPI) {
   /** Finalize the current batch: if 2+ smart-mode agents, register as a group. */
   function finalizeBatch() {
     batchFinalizeTimer = undefined;
+    if (mailboxActivationClosed) {
+      currentBatchAgents = [];
+      return;
+    }
     const batchAgents = [...currentBatchAgents];
     currentBatchAgents = [];
 
@@ -1025,6 +1055,43 @@ export default function (pi: ExtensionAPI) {
         return textResult(`Mailbox acknowledgement complete. Matched ${matched} message${matched === 1 ? "" : "s"}.`);
       } catch (error) {
         return textResult(error instanceof Error ? error.message : String(error));
+      }
+    },
+  }));
+
+  // ---- stop_agent tool ----
+  pi.registerTool(defineTool({
+    name: SUBAGENT_TOOL_NAMES.STOP,
+    label: "Stop Agent",
+    description: "Stop a direct child Agent and always stop its entire current-process runtime subtree. Descendants are stopped deepest-first; cascade cannot be disabled.",
+    promptSnippet: "Stop a direct child Agent and its full runtime subtree",
+    parameters: Type.Object({
+      agent_id: Type.String({ minLength: 1, maxLength: 128, description: "Direct child Agent ID to stop." }),
+      reason: Type.Optional(Type.String({ maxLength: 500, description: "Optional reason, limited to 500 UTF-8 bytes." })),
+    }, { additionalProperties: false }),
+    execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
+      if (params.reason !== undefined && Buffer.byteLength(params.reason, "utf8") > 500) {
+        return textResult(JSON.stringify({ error: { code: "invalid_reason", message: "reason exceeds 500 UTF-8 bytes." } }));
+      }
+      const caller = resolveSessionLineage(
+        ctx.sessionManager,
+        manager.getMaxTreeLevels(),
+        ctx.getSystemPrompt?.(),
+      );
+      try {
+        return textResult(JSON.stringify(agentRuntimeTree.stopDirectChild(
+          caller,
+          ctx.cwd,
+          params.agent_id,
+          params.reason,
+        )));
+      } catch {
+        return textResult(JSON.stringify({
+          error: {
+            code: "not_found",
+            message: "Agent was not found or is not authorized for this operation.",
+          },
+        }));
       }
     },
   }));

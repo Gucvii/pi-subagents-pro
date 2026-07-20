@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentSession, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it } from "vitest";
-import { inspectAgentRecord, MAX_JSONL_LINE_BYTES, readAgentEntry } from "../src/agent-inspection.js";
+import { findLastAgentErrorRef, findLatestAgentEntryRef, inspectAgentRecord, MAX_JSONL_LINE_BYTES, readAgentEntry } from "../src/agent-inspection.js";
 import type { AgentRecord } from "../src/types.js";
 
 const dirs: string[] = [];
@@ -91,6 +91,61 @@ function writeSession(entries: SessionEntry[], sessionId = "session-durable-1"):
 function refs(output: Record<string, unknown>): string[] {
   return (output.entries as Array<{ ref: string }>).map((entry) => entry.ref);
 }
+
+describe("findLastAgentErrorRef", () => {
+  it("finds a live tool error ref that can be read directly", async () => {
+    const agent = record([userEntry, errorEntry], { status: "error", error: "failed" });
+    const ref = await findLastAgentErrorRef(agent);
+    expect(ref).toMatch(/^e_[a-f0-9]{24}$/);
+    const entry = await readAgentEntry(agent, ref!);
+    expect(entry.json).toContain("TOP SECRET TOOL ERROR");
+  });
+
+  it("keeps this run's newest provider terminal error when an older tool error precedes the boundary", async () => {
+    const providerError = {
+      type: "message",
+      id: "a-error",
+      parentId: "t1",
+      timestamp: "2026-01-01T00:00:03.000Z",
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider failed", timestamp: 4 },
+    } as unknown as SessionEntry;
+    const entries = [userEntry];
+    const agent = record(entries, { status: "error", error: "provider failed" });
+    const boundary = await findLatestAgentEntryRef(agent);
+    entries.push(errorEntry, providerError);
+
+    const ref = await findLastAgentErrorRef(agent, boundary);
+    const entry = await readAgentEntry(agent, ref!);
+    expect(entry.json).toContain("provider failed");
+    expect(entry.json).not.toContain("TOP SECRET TOOL ERROR");
+  });
+
+  it("does not invent a ref when no terminal canonical error entry exists", async () => {
+    expect(await findLastAgentErrorRef(record([userEntry, assistantEntry], { status: "error", error: "length" }))).toBeUndefined();
+    expect(await findLastAgentErrorRef(record([errorEntry, assistantEntry], { status: "error", error: "later failure" }))).toBeUndefined();
+  });
+
+  it("surfaces an unavailable durable boundary so resume can fail closed", async () => {
+    await expect(findLatestAgentEntryRef(durableRecord(tempPath("missing.jsonl")))).rejects.toThrow("Session file is missing");
+  });
+
+  it("limits resume error lookup to entries after the captured latest-entry boundary", async () => {
+    const entries = [userEntry, errorEntry];
+    const agent = record(entries, { status: "error", error: "old failure" });
+    const boundary = await findLatestAgentEntryRef(agent);
+    expect(boundary).toMatch(/^e_/);
+
+    entries.push({
+      type: "message",
+      id: "resume-prompt",
+      parentId: "t1",
+      timestamp: "2026-01-01T00:00:04.000Z",
+      message: { role: "user", content: "again", timestamp: 5 },
+    } as unknown as SessionEntry);
+    expect(await findLastAgentErrorRef(agent, boundary)).toBeUndefined();
+    expect(await findLastAgentErrorRef(agent, "e_000000000000000000000000")).toBeUndefined();
+  });
+});
 
 describe("inspectAgentRecord", () => {
   it("returns a small body-free status with an opaque digest cursor", async () => {

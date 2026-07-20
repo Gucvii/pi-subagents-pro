@@ -172,6 +172,89 @@ function metadata(entry: RawEntry, sessionId: string): EntryMetadata {
   return result;
 }
 
+function terminalErrorRef(entry: RawEntry, sessionId: string): string | null | undefined {
+  const message = messageOf(entry);
+  if (!message) return undefined;
+  if (message.role === "assistant") return isErrorEntry(entry) ? makeRef(sessionId, entry.id) : null;
+  if (message.role === "toolResult" && message.isError === true) return makeRef(sessionId, entry.id);
+  return undefined;
+}
+
+/** Return the newest canonical entry ref without exposing its raw entry ID. */
+export async function findLatestAgentEntryRef(record: InspectionRecord): Promise<string | undefined> {
+  const source = sourceFor(record);
+  if ("code" in source) throw new InspectionFailure(source);
+  if (source.kind === "live") {
+    const entry = asRawEntry(source.entries.at(-1));
+    return entry ? makeRef(source.sessionId, entry.id) : undefined;
+  }
+  const found = await withDurable(source.sessionFile, async (handle, header) => {
+    for await (const line of reverseLines(handle, header.fileSize)) {
+      if (line.bytes.length === 0) continue;
+      const parsed = parseLine(line) as Record<string, unknown>;
+      if (parsed?.type === "session") break;
+      const entry = asRawEntry(parsed);
+      if (!entry) throw new InspectionFailure({ code: "malformed", message: "Session entry is missing id or timestamp." });
+      return makeRef(header.sessionId, entry.id);
+    }
+    return undefined;
+  });
+  if (found && typeof found === "object" && "code" in found) throw new InspectionFailure(found);
+  return typeof found === "string" ? found : undefined;
+}
+
+/**
+ * Find the terminal canonical error entry without returning its body or raw ID.
+ * When afterRef is supplied, only entries added after that invocation boundary
+ * are eligible; a missing boundary fails closed instead of reusing an old error.
+ */
+export async function findLastAgentErrorRef(record: InspectionRecord, afterRef?: string): Promise<string | undefined> {
+  const source = sourceFor(record);
+  if ("code" in source) return undefined;
+
+  const scan = async (entries: AsyncIterable<RawEntry>, sessionId: string): Promise<string | undefined> => {
+    let candidate: string | undefined;
+    let terminalSeen = false;
+    for await (const entry of entries) {
+      const entryRef = makeRef(sessionId, entry.id);
+      if (afterRef && entryRef === afterRef) return candidate;
+      if (terminalSeen) continue;
+      const ref = terminalErrorRef(entry, sessionId);
+      if (ref === null) terminalSeen = true;
+      else if (ref !== undefined) candidate ??= ref;
+      if (!afterRef && ref !== undefined) return ref ?? undefined;
+    }
+    return afterRef ? undefined : candidate;
+  };
+
+  if (source.kind === "live") {
+    const liveSource = source;
+    async function* liveEntries(): AsyncIterable<RawEntry> {
+      for (let index = liveSource.entries.length - 1; index >= 0; index--) {
+        const entry = asRawEntry(liveSource.entries[index]);
+        if (!entry) return;
+        yield entry;
+      }
+    }
+    return scan(liveEntries(), source.sessionId);
+  }
+
+  const found = await withDurable(source.sessionFile, async (handle, header) => {
+    async function* durableEntries(): AsyncIterable<RawEntry> {
+      for await (const line of reverseLines(handle, header.fileSize)) {
+        if (line.bytes.length === 0) continue;
+        const parsed = parseLine(line) as Record<string, unknown>;
+        if (parsed?.type === "session") break;
+        const entry = asRawEntry(parsed);
+        if (!entry) throw new InspectionFailure({ code: "malformed", message: "Session entry is missing id or timestamp." });
+        yield entry;
+      }
+    }
+    return scan(durableEntries(), header.sessionId);
+  });
+  return typeof found === "string" ? found : undefined;
+}
+
 function sourceFor(record: InspectionRecord): Source | InspectionDiagnostic {
   if ("session" in record && record.session?.sessionManager) {
     const manager = record.session.sessionManager;
@@ -509,6 +592,7 @@ export async function inspectAgentRecord(
     ...(activity?.lastActivityAt !== undefined && { activity_age_ms: Math.max(0, Date.now() - activity.lastActivityAt) }),
     result_available: record.result !== undefined,
     error_available: record.error !== undefined,
+    ...(record.status === "error" && record.errorRef && { error_ref: record.errorRef }),
     persistence,
     resumable: Boolean(("session" in record && record.session) || (persistence === "durable" && sessionFile === "available")),
     session_file: sessionFile,

@@ -119,6 +119,8 @@ export function toPersistedAgentRecord(record: AgentRecord): PersistedAgentRecor
     status: record.status,
     result: record.result,
     error: record.error,
+    stopReason: record.stopReason,
+    errorRef: record.errorRef,
     toolUses: record.toolUses,
     startedAt: record.startedAt,
     createdAt: record.createdAt,
@@ -152,6 +154,7 @@ function isPersistedRecord(value: unknown): value is PersistedAgentRecord {
     && typeof record.status === "string"
     && typeof record.startedAt === "number"
     && typeof record.toolUses === "number"
+    && (record.errorRef === undefined || /^e_[a-f0-9]{24}$/.test(record.errorRef))
     && typeof record.compactionCount === "number"
     && validatePersistedAgentLineage({ id: record.id, lineage: record.lineage }).ok;
 }

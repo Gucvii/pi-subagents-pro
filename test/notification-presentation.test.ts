@@ -36,4 +36,10 @@ describe("completion notification presentation", () => {
     expect(details.modelName).toBe("opencode-go/deepseek-v4-flash");
     expect(details.thinking).toBe("max");
   });
+
+  it("carries the same directly-readable error_ref in XML and renderer details", () => {
+    const record = { ...makeRecord(), status: "error" as const, error: "provider failed", errorRef: "e_0123456789abcdef01234567" };
+    expect(formatTaskNotification(record, 500)).toContain("<error_ref>e_0123456789abcdef01234567</error_ref>");
+    expect(buildNotificationDetails(record, 500).errorRef).toBe("e_0123456789abcdef01234567");
+  });
 });

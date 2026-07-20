@@ -102,6 +102,8 @@ export interface AgentRecord {
   status: "queued" | "running" | "completed" | "steered" | "aborted" | "stopped" | "error";
   result?: string;
   error?: string;
+  stopReason?: string;
+  errorRef?: string;
   toolUses: number;
   startedAt: number;
   /** First creation time; unlike startedAt, this is not replaced on resume. */
@@ -173,6 +175,8 @@ export interface PersistedAgentRecord {
   status: AgentRecord["status"];
   result?: string;
   error?: string;
+  stopReason?: string;
+  errorRef?: string;
   toolUses: number;
   startedAt: number;
   createdAt?: number;
@@ -239,6 +243,7 @@ export interface NotificationDetails {
   durationMs: number;
   outputFile?: string;
   error?: string;
+  errorRef?: string;
   resultPreview: string;
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];

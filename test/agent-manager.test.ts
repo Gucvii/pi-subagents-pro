@@ -1,7 +1,8 @@
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
-import type { AgentRecord } from "../src/types.js";
+import { agentRuntimeTree } from "../src/agent-runtime-tree.js";
+import type { AgentLineage, AgentRecord } from "../src/types.js";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
@@ -622,6 +623,51 @@ describe("AgentManager — SpawnOptions.cwd passthrough (#96)", () => {
     expect(opts.configCwd).toBeUndefined();
   });
 
+  it.each(["error", "stopped"] as const)("preserves branch evidence on %s cleanup and omits an unreadable memory error_ref", async (terminal) => {
+    const { createWorktree, cleanupWorktree } = await import("../src/worktree.js");
+    vi.mocked(createWorktree).mockReturnValueOnce({
+      path: "/wt/copy", branch: "pi-agent-x", baseSha: "abc", workPath: "/wt/copy",
+    });
+    vi.mocked(cleanupWorktree).mockReturnValueOnce({ hasChanges: true, branch: "pi-agent-saved", path: "/wt/copy" });
+    let rejectRun!: (error: Error) => void;
+    const session = {
+      dispose: vi.fn(),
+      sessionManager: {
+        getSessionId: () => "memory-worktree-session",
+        getEntries: () => [{
+          type: "message",
+          id: "provider-error",
+          timestamp: "2026-01-01T00:00:01.000Z",
+          message: { role: "assistant", content: [], stopReason: "error", errorMessage: "provider failed", timestamp: 1 },
+        }],
+      },
+    } as any;
+    vi.mocked(runAgent).mockImplementationOnce((_ctx, _type, _prompt, options) => {
+      options.onSessionCreated?.(session);
+      return new Promise((_resolve, reject) => { rejectRun = reject; });
+    });
+    const changed: string[] = [];
+    manager = new AgentManager(undefined, 4, undefined, undefined, 3, record => changed.push(record.result ?? ""));
+    const id = manager.spawn(mockPi, mockCtx, "general-purpose", "test", {
+      description: "test",
+      isolation: "worktree",
+      persistSession: false,
+      isBackground: true,
+    });
+    const record = manager.getRecord(id)!;
+    if (terminal === "stopped") manager.abort(id, "stop test");
+    rejectRun(new Error("provider rejected"));
+    await record.promise;
+
+    expect(record.status).toBe(terminal);
+    expect(record.result).toContain("Changes saved to branch `pi-agent-saved`");
+    expect(record.result).toContain("git merge pi-agent-saved");
+    expect(changed.at(-1)).toContain("pi-agent-saved");
+    expect(record.session).toBeUndefined();
+    expect(session.dispose).toHaveBeenCalled();
+    expect(record.errorRef).toBeUndefined();
+  });
+
   it("relative cwd throws immediately; no orphan record", () => {
     vi.mocked(runAgent).mockClear();
     manager = new AgentManager();
@@ -1040,11 +1086,97 @@ describe("AgentManager — resolved runs with a failed final turn map to error (
     expect(record.status).toBe("error");
     expect(record.result).toBe("new partial progress"); // salvageable, this-run text
   });
+
+  it("resume(): does not reuse the previous invocation's error_ref when this run fails before a new error entry", async () => {
+    const oldError = {
+      type: "message",
+      id: "old-provider-error",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      message: { role: "assistant", content: [], stopReason: "error", errorMessage: "old provider failure", timestamp: 1 },
+    };
+    const session = {
+      dispose: vi.fn(),
+      sessionManager: {
+        getSessionId: () => "resume-boundary-session",
+        getEntries: () => [oldError],
+      },
+    } as any;
+    manager = new AgentManager();
+    vi.mocked(runAgent).mockResolvedValue({
+      responseText: "",
+      session,
+      aborted: false,
+      steered: false,
+      failure: "old provider failure",
+    });
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "x", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    const oldRef = record.errorRef;
+    expect(oldRef).toMatch(/^e_/);
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockRejectedValueOnce(new Error("resume setup failed before prompt append"));
+    await manager.resume(id, "retry");
+
+    expect(record.status).toBe("error");
+    expect(record.error).toContain("resume setup failed");
+    expect(record.errorRef).toBeUndefined();
+    expect(record.errorRef).not.toBe(oldRef);
+  });
+
+  it("resume(): claims the invocation before boundary I/O so an immediate stop prevents the runner call", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "x", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockClear();
+    const resumed = manager.resume(id, "more");
+    expect(manager.abort(id, "immediate stop")).toBe(true);
+    await resumed;
+
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(record.status).toBe("stopped");
+  });
+
+  it("resume(): uses a fresh abort controller and stopped wins over its rejection", async () => {
+    manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "X", "p", { description: "x", isBackground: true });
+    const record = manager.getRecord(id)!;
+    await record.promise;
+    const originalController = record.abortController;
+
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    let resumedSignal: AbortSignal | undefined;
+    vi.mocked(resumeMock).mockImplementation((_session, _prompt, options) => new Promise((_resolve, reject) => {
+      resumedSignal = options.signal;
+      options.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+    }));
+
+    const resumed = manager.resume(id, "more");
+    await vi.waitFor(() => expect(resumedSignal).toBeDefined());
+    expect(record.abortController).not.toBe(originalController);
+    expect(manager.abort(id, "stop resumed run")).toBe(true);
+    await resumed;
+
+    expect(resumedSignal?.aborted).toBe(true);
+    expect(record.status).toBe("stopped");
+    expect(record.error).toBeUndefined();
+    expect(record.stopReason).toBe("stop resumed run");
+  });
 });
 
 describe("AgentManager — bounded Agent tree", () => {
   let manager: AgentManager;
-  afterEach(() => manager?.dispose());
+  let parentManager: AgentManager | undefined;
+  afterEach(() => {
+    manager?.dispose();
+    parentManager?.dispose();
+  });
 
   const ctxAt = (depth: number, maxTreeLevels = 3) => ({
     cwd: "/tmp",
@@ -1065,21 +1197,36 @@ describe("AgentManager — bounded Agent tree", () => {
   } as any);
 
   it("assigns trusted parent/root/depth metadata to a child record", async () => {
-    manager = new AgentManager();
-    resolvedRun();
+    let finishParent!: (value: any) => void;
+    vi.mocked(runAgent)
+      .mockImplementationOnce(() => new Promise(resolve => { finishParent = resolve; }))
+      .mockResolvedValueOnce({ responseText: "done", session: mockSession(), aborted: false, steered: false });
+    parentManager = new AgentManager();
+    const parentId = parentManager.spawn(mockPi, ctxAt(0), "worker", "parent", { description: "parent", isBackground: true });
+    const parent = parentManager.getRecord(parentId)!;
 
-    const id = manager.spawn(mockPi, ctxAt(1), "worker", "go", { description: "nested" });
+    manager = new AgentManager();
+    const childCtx = {
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => parent.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: parent.lineage }],
+      },
+    } as any;
+    const id = manager.spawn(mockPi, childCtx, "worker", "go", { description: "nested" });
     const record = manager.getRecord(id)!;
     await record.promise;
 
     expect(record.lineage).toEqual({
       agentId: id,
-      parentAgentId: "agent-1",
+      parentAgentId: parent.id,
       rootAgentId: "main",
       depth: 2,
       maxTreeLevels: 3,
     });
     expect(vi.mocked(runAgent).mock.calls.at(-1)?.[3].lineage).toEqual(record.lineage);
+    finishParent({ responseText: "parent done", session: mockSession(), aborted: false, steered: false });
+    await parent.promise;
   });
 
   it("rejects level four before creating a record or invoking the runner", () => {
@@ -1106,9 +1253,244 @@ describe("AgentManager — bounded Agent tree", () => {
   });
 });
 
+describe("AgentManager — real multi-manager stop cascade", () => {
+  const managers: AgentManager[] = [];
+  afterEach(() => {
+    for (const manager of managers) manager.dispose();
+    managers.length = 0;
+    agentRuntimeTree.resetForTests();
+  });
+
+  it("starts a valid queued child after its parent completes normally", async () => {
+    let finishParent!: (value: any) => void;
+    let finishBlocker!: (value: any) => void;
+    const startedPrompts: string[] = [];
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, prompt) => {
+      startedPrompts.push(prompt);
+      if (prompt === "parent") return new Promise(resolve => { finishParent = resolve; });
+      if (prompt === "blocker") return new Promise(resolve => { finishBlocker = resolve; });
+      return Promise.resolve({ responseText: "child done", session: mockSession(), aborted: false, steered: false });
+    });
+    const parentManager = new AgentManager(undefined, 1, undefined, undefined, 3);
+    const childManager = new AgentManager(undefined, 1, undefined, undefined, 3);
+    managers.push(parentManager, childManager);
+    const rootCtx = {
+      cwd: "/tmp",
+      sessionManager: { getSessionId: () => "main", getBranch: () => [] },
+    } as any;
+
+    const blockerId = childManager.spawn(mockPi, rootCtx, "worker", "blocker", {
+      description: "queue blocker", isBackground: true,
+    });
+    const parentId = parentManager.spawn(mockPi, rootCtx, "worker", "parent", {
+      description: "parent", isBackground: true,
+    });
+    const parent = parentManager.getRecord(parentId)!;
+    const childCtx = {
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => parent.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: parent.lineage }],
+      },
+    } as any;
+    const childId = childManager.spawn(mockPi, childCtx, "worker", "queued-child", {
+      description: "queued child", isBackground: true,
+    });
+    const child = childManager.getRecord(childId)!;
+    expect(child.status).toBe("queued");
+
+    finishParent({ responseText: "parent done", session: mockSession(), aborted: false, steered: false });
+    await parent.promise;
+    expect(parent.status).toBe("completed");
+    expect(child.status).toBe("queued");
+
+    const blocker = childManager.getRecord(blockerId)!;
+    finishBlocker({ responseText: "blocker done", session: mockSession(), aborted: false, steered: false });
+    await blocker.promise;
+    await child.promise;
+
+    expect(startedPrompts).toEqual(["blocker", "parent", "queued-child"]);
+    expect(child.status).toBe("completed");
+  });
+
+  it("never starts a queued child after its ancestor receives the stopping marker", async () => {
+    let finishBlocker!: (value: any) => void;
+    const startedPrompts: string[] = [];
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, prompt, options) => {
+      startedPrompts.push(prompt);
+      if (prompt === "blocker") return new Promise(resolve => { finishBlocker = resolve; });
+      return new Promise((_resolve, reject) => {
+        options.signal?.addEventListener("abort", () => reject(new Error("stopped")), { once: true });
+      });
+    });
+    const parentManager = new AgentManager(undefined, 1, undefined, undefined, 3);
+    const childManager = new AgentManager(undefined, 1, undefined, undefined, 3);
+    managers.push(parentManager, childManager);
+    const rootCtx = {
+      cwd: "/tmp",
+      sessionManager: { getSessionId: () => "main", getBranch: () => [] },
+    } as any;
+
+    const blockerId = childManager.spawn(mockPi, rootCtx, "worker", "blocker", {
+      description: "queue blocker", isBackground: true,
+    });
+    const parentId = parentManager.spawn(mockPi, rootCtx, "worker", "parent", {
+      description: "parent", isBackground: true,
+    });
+    const parent = parentManager.getRecord(parentId)!;
+    const childCtx = {
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => parent.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: parent.lineage }],
+      },
+    } as any;
+    const childId = childManager.spawn(mockPi, childCtx, "worker", "queued-child", {
+      description: "queued child", isBackground: true,
+    });
+    const child = childManager.getRecord(childId)!;
+    expect(child.status).toBe("queued");
+
+    const caller: AgentLineage = { agentId: "main", rootAgentId: "main", depth: 0, maxTreeLevels: 3 };
+    agentRuntimeTree.stopDirectChild(caller, "/tmp", parentId, "stop before queue drain");
+    expect(parent.status).toBe("stopped");
+    expect(child.status).toBe("stopped");
+    await parent.promise;
+
+    const blocker = childManager.getRecord(blockerId)!;
+    finishBlocker({ responseText: "blocker done", session: mockSession(), aborted: false, steered: false });
+    await blocker.promise;
+
+    expect(startedPrompts).toEqual(["blocker", "parent"]);
+    expect(child.status).toBe("stopped");
+    expect(child.promise).toBeUndefined();
+  });
+
+  it("stops queued/running descendants deepest-first, drains, settles, and rejects a real late spawn", async () => {
+    const abortOrder: string[] = [];
+    const completions: string[] = [];
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, prompt, options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => {
+        abortOrder.push(prompt);
+        reject(new Error(`aborted ${prompt}`));
+      }, { once: true });
+    }));
+    const complete = (record: AgentRecord) => {
+      completions.push(record.description);
+      throw new Error(`callback failed for ${record.description}`);
+    };
+    const parentManager = new AgentManager(complete, 1, undefined, undefined, 4);
+    const childManager = new AgentManager(complete, 1, undefined, undefined, 4);
+    const grandManager = new AgentManager(complete, 1, undefined, undefined, 4);
+    managers.push(parentManager, childManager, grandManager);
+
+    const rootCtx = {
+      cwd: "/tmp",
+      sessionManager: { getSessionId: () => "main", getBranch: () => [] },
+    } as any;
+    const parentId = parentManager.spawn(mockPi, rootCtx, "worker", "parent-run", { description: "parent", isBackground: true });
+    const parent = parentManager.getRecord(parentId)!;
+    const ctxFor = (record: AgentRecord) => ({
+      cwd: "/tmp",
+      sessionManager: {
+        getSessionId: () => record.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: record.lineage }],
+      },
+    }) as any;
+    const childId = childManager.spawn(mockPi, ctxFor(parent), "worker", "child-run", { description: "child", isBackground: true });
+    const child = childManager.getRecord(childId)!;
+    const grandRunningId = grandManager.spawn(mockPi, ctxFor(child), "worker", "grand-run", { description: "grand-running", isBackground: true });
+    const grandQueuedId = grandManager.spawn(mockPi, ctxFor(child), "worker", "grand-queued", { description: "grand-queued", isBackground: true });
+    const grandRunning = grandManager.getRecord(grandRunningId)!;
+    const grandQueued = grandManager.getRecord(grandQueuedId)!;
+    expect(grandQueued.status).toBe("queued");
+
+    const caller: AgentLineage = { agentId: "main", rootAgentId: "main", depth: 0, maxTreeLevels: 4 };
+    const stop = agentRuntimeTree.stopDirectChild(caller, "/tmp", parentId, "integration stop");
+    expect(stop.stopped_agents.map(entry => entry.agent_id)).toEqual(expect.arrayContaining([
+      parentId, childId, grandRunningId, grandQueuedId,
+    ]));
+    expect(abortOrder.indexOf("grand-run")).toBeLessThan(abortOrder.indexOf("child-run"));
+    expect(abortOrder.indexOf("child-run")).toBeLessThan(abortOrder.indexOf("parent-run"));
+    expect(parent.abortController?.signal.aborted).toBe(true);
+    expect(child.abortController?.signal.aborted).toBe(true);
+    expect(grandRunning.abortController?.signal.aborted).toBe(true);
+    expect(grandQueued.status).toBe("stopped");
+
+    await Promise.all([parent.promise, child.promise, grandRunning.promise]);
+    expect(() => grandManager.spawn(mockPi, ctxFor(child), "worker", "late", {
+      description: "late grandchild",
+      isBackground: true,
+    })).toThrow("parent is no longer active");
+    expect([parent.status, child.status, grandRunning.status, grandQueued.status]).toEqual([
+      "stopped", "stopped", "stopped", "stopped",
+    ]);
+    expect(completions).toEqual(expect.arrayContaining(["parent", "child", "grand-running", "grand-queued"]));
+    expect(parentManager.hasRunning()).toBe(false);
+    expect(childManager.hasRunning()).toBe(false);
+    expect(grandManager.hasRunning()).toBe(false);
+    expect(agentRuntimeTree.stopDirectChild(caller, "/tmp", parentId, "ignored")).toEqual(stop);
+  });
+
+  it("supports a three-level custom-cwd/worktree-style chain across managers and cascades from the authorized root cwd", async () => {
+    vi.mocked(runAgent).mockImplementation((_ctx, _type, _prompt, options) => new Promise((_resolve, reject) => {
+      options.signal?.addEventListener("abort", () => reject(new Error("cascade abort")), { once: true });
+    }));
+    const parentManager = new AgentManager(undefined, 4, undefined, undefined, 5);
+    const childManager = new AgentManager(undefined, 4, undefined, undefined, 5);
+    const grandManager = new AgentManager(undefined, 4, undefined, undefined, 5);
+    managers.push(parentManager, childManager, grandManager);
+
+    const rootCtx = {
+      cwd: "/authorization/root",
+      sessionManager: { getSessionId: () => "cwd-main", getBranch: () => [] },
+    } as any;
+    const parentId = parentManager.spawn(mockPi, rootCtx, "worker", "parent", {
+      description: "custom parent", isBackground: true, cwd: "/private/tmp",
+    });
+    const parent = parentManager.getRecord(parentId)!;
+    const childCtx = {
+      cwd: "/tmp/pi-agent-worktrees/parent-copy",
+      sessionManager: {
+        getSessionId: () => parent.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: parent.lineage }],
+      },
+    } as any;
+    const childId = childManager.spawn(mockPi, childCtx, "worker", "child", {
+      description: "worktree child", isBackground: true, cwd: "/tmp",
+    });
+    const child = childManager.getRecord(childId)!;
+    const grandCtx = {
+      cwd: "/private/tmp/pi-agent-worktrees/child-copy",
+      sessionManager: {
+        getSessionId: () => child.id,
+        getBranch: () => [{ type: "custom", customType: "pi-subagents:lineage", data: child.lineage }],
+      },
+    } as any;
+    const grandId = grandManager.spawn(mockPi, grandCtx, "worker", "grandchild", {
+      description: "custom grandchild", isBackground: true, cwd: "/private/tmp",
+    });
+    const grandchild = grandManager.getRecord(grandId)!;
+
+    expect([parent.parentCwd, child.parentCwd, grandchild.parentCwd]).toEqual([
+      "/authorization/root",
+      "/tmp/pi-agent-worktrees/parent-copy",
+      "/private/tmp/pi-agent-worktrees/child-copy",
+    ]);
+    const caller: AgentLineage = { agentId: "cwd-main", rootAgentId: "cwd-main", depth: 0, maxTreeLevels: 5 };
+    const stopped = agentRuntimeTree.stopDirectChild(caller, rootCtx.cwd, parentId, "cross-cwd cascade");
+    expect(stopped.stopped_agents.map(({ agent_id }) => agent_id)).toEqual([grandId, childId, parentId]);
+    await Promise.all([parent.promise, child.promise, grandchild.promise]);
+    expect([parent.status, child.status, grandchild.status]).toEqual(["stopped", "stopped", "stopped"]);
+  });
+});
+
 describe("AgentManager — durable cross-process resume", () => {
   let manager: AgentManager;
-  afterEach(() => manager?.dispose());
+  afterEach(() => {
+    manager?.dispose();
+    agentRuntimeTree.resetForTests();
+  });
 
   const persisted = (status: "completed" | "running" = "completed") => ({
     id: "durable-agent",
@@ -1145,6 +1527,96 @@ describe("AgentManager — durable cross-process resume", () => {
       error: expect.stringContaining("previous Pi process exited"),
     });
     expect(changed).toHaveBeenCalled();
+  });
+
+  it.each(["missing", "pruned"] as const)("rejects a nested durable resume when its parent runtime is %s without mutating the record", async (parentState) => {
+    manager = new AgentManager();
+    const parentLineage: AgentLineage = {
+      agentId: "parent-agent",
+      parentAgentId: "main",
+      rootAgentId: "main",
+      depth: 1,
+      maxTreeLevels: 3,
+    };
+    const nested = {
+      ...persisted(),
+      parentCwd: "/tmp",
+      lineage: {
+        agentId: "durable-agent",
+        parentAgentId: parentLineage.agentId,
+        rootAgentId: parentLineage.rootAgentId,
+        depth: 2,
+        maxTreeLevels: 3,
+      },
+    };
+    manager.restorePersisted([nested]);
+    if (parentState === "pruned") {
+      const owner = {};
+      agentRuntimeTree.register(parentLineage, "/tmp", owner, {
+        getStatus: () => "completed",
+        stop: () => false,
+      });
+      agentRuntimeTree.markSettled(parentLineage.agentId, owner);
+    }
+    const record = manager.getRecord(nested.id)!;
+    const before = {
+      status: record.status,
+      result: record.result,
+      error: record.error,
+      abortController: record.abortController,
+      promise: record.promise,
+    };
+    vi.mocked(runAgent).mockClear();
+
+    await expect(manager.resume(nested.id, "continue", undefined, {
+      pi: mockPi,
+      ctx: mockCtx,
+      thinkingLevel: "off",
+    })).rejects.toThrow("parent runtime is missing");
+    expect({
+      status: record.status,
+      result: record.result,
+      error: record.error,
+      abortController: record.abortController,
+      promise: record.promise,
+    }).toEqual(before);
+    expect(runAgent).not.toHaveBeenCalled();
+  });
+
+  it("allows a nested durable resume while its exact parent runtime remains active", async () => {
+    manager = new AgentManager();
+    const parentLineage: AgentLineage = {
+      agentId: "parent-agent",
+      parentAgentId: "main",
+      rootAgentId: "main",
+      depth: 1,
+      maxTreeLevels: 3,
+    };
+    agentRuntimeTree.register(parentLineage, "/tmp", {}, {
+      getStatus: () => "running",
+      stop: () => true,
+    });
+    manager.restorePersisted([{
+      ...persisted(),
+      parentCwd: "/tmp",
+      lineage: {
+        agentId: "durable-agent",
+        parentAgentId: parentLineage.agentId,
+        rootAgentId: parentLineage.rootAgentId,
+        depth: 2,
+        maxTreeLevels: 3,
+      },
+    }]);
+    resolvedRun();
+
+    const record = await manager.resume("durable-agent", "continue", undefined, {
+      pi: mockPi,
+      ctx: mockCtx,
+      thinkingLevel: "off",
+    });
+
+    expect(record?.status).toBe("completed");
+    expect(runAgent).toHaveBeenCalledOnce();
   });
 
   it("lazily opens the durable Pi session only when resume is requested", async () => {
@@ -1221,5 +1693,71 @@ describe("AgentManager — durable cross-process resume", () => {
     expect(reopenedSession.dispose).toHaveBeenCalled();
     expect(record?.session).toBeUndefined();
     expect(record?.sessionCwd).toBe("/repo");
+  });
+});
+
+describe("AgentManager — disposed fail-closed lifecycle", () => {
+  afterEach(() => agentRuntimeTree.resetForTests());
+
+  it("rejects stale spawn before validation, runtime registration, record creation, or runner/session work", () => {
+    const manager = new AgentManager();
+    manager.dispose();
+    vi.mocked(runAgent).mockClear();
+    const register = vi.spyOn(agentRuntimeTree, "register");
+
+    expect(() => manager.spawn(mockPi, mockCtx, "worker", "stale", {
+      description: "stale spawn",
+      cwd: "/definitely/missing",
+      isBackground: true,
+    })).toThrow("manager is disposed");
+
+    expect(register).not.toHaveBeenCalled();
+    expect(runAgent).not.toHaveBeenCalled();
+    expect(manager.listAgents()).toEqual([]);
+    register.mockRestore();
+  });
+
+  it("rejects stale resume before runtime activation or runner work", async () => {
+    const manager = new AgentManager();
+    resolvedRun();
+    const id = manager.spawn(mockPi, mockCtx, "worker", "initial", {
+      description: "initial",
+      isBackground: true,
+    });
+    await manager.getRecord(id)!.promise;
+    manager.dispose();
+
+    const activate = vi.spyOn(agentRuntimeTree, "activate");
+    const { resumeAgent: resumeMock } = await import("../src/agent-runner.js");
+    vi.mocked(resumeMock).mockClear();
+    vi.mocked(runAgent).mockClear();
+
+    await expect(manager.resume(id, "stale resume", undefined, {
+      pi: mockPi,
+      ctx: mockCtx,
+      thinkingLevel: "off",
+    })).rejects.toThrow("manager is disposed");
+
+    expect(activate).not.toHaveBeenCalled();
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(runAgent).not.toHaveBeenCalled();
+    activate.mockRestore();
+  });
+
+  it("never drains a stale queued entry once disposal has begun", () => {
+    const manager = new AgentManager(undefined, 1);
+    vi.mocked(runAgent).mockImplementation(() => new Promise(() => {}));
+    manager.spawn(mockPi, mockCtx, "worker", "running", { description: "running", isBackground: true });
+    manager.spawn(mockPi, mockCtx, "worker", "queued-a", { description: "queued-a", isBackground: true });
+    manager.spawn(mockPi, mockCtx, "worker", "queued-b", { description: "queued-b", isBackground: true });
+    expect(runAgent).toHaveBeenCalledTimes(1);
+
+    // Model a completion/disposal race where capacity was released immediately
+    // before abortAll visits queued records and those aborts call drainQueue().
+    (manager as any).runningBackground = 0;
+    manager.dispose();
+
+    expect(runAgent).toHaveBeenCalledTimes(1);
+    expect(manager.listAgents()).toEqual([]);
   });
 });

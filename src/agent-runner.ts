@@ -41,6 +41,7 @@ export const SUBAGENT_TOOL_NAMES = {
   INSPECT: "inspect_agent",
   READ_ENTRY: "read_agent_entry",
   STEER: "steer_subagent",
+  STOP: "stop_agent",
   MAILBOX: MAILBOX_TOOL_NAME,
 } as const;
 
@@ -51,6 +52,7 @@ const RECURSIVE_TOOL_NAMES: string[] = [
   SUBAGENT_TOOL_NAMES.INSPECT,
   SUBAGENT_TOOL_NAMES.READ_ENTRY,
   SUBAGENT_TOOL_NAMES.STEER,
+  SUBAGENT_TOOL_NAMES.STOP,
 ];
 const THIS_MODULE_PATH = fileURLToPath(import.meta.url);
 const SELF_EXTENSION_PATH = join(dirname(THIS_MODULE_PATH), `index${extname(THIS_MODULE_PATH)}`);
@@ -414,6 +416,10 @@ function finalTurnError(session: AgentSession, startIndex = 0): string | undefin
  */
 function forwardAbortSignal(session: AgentSession, signal?: AbortSignal): () => void {
   if (!signal) return () => {};
+  if (signal.aborted) {
+    session.abort();
+    return () => {};
+  }
   const onAbort = () => session.abort();
   signal.addEventListener("abort", onAbort, { once: true });
   return () => signal.removeEventListener("abort", onAbort);
@@ -845,6 +851,7 @@ export async function resumeAgent(
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+    onTextDelta?: (delta: string, fullText: string) => void;
     signal?: AbortSignal;
   } = {},
 ): Promise<{ text: string; failure?: string }> {
@@ -855,8 +862,14 @@ export async function resumeAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
+  let currentMessageText = "";
+  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction || options.onTextDelta)
     ? session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "message_start" && event.message.role === "assistant") currentMessageText = "";
+        if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+          currentMessageText += event.assistantMessageEvent.delta;
+          options.onTextDelta?.(event.assistantMessageEvent.delta, currentMessageText);
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
