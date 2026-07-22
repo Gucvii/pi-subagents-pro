@@ -400,10 +400,10 @@ export class FleetList {
   }
 
   private statusPresentation(record: AgentRecord, theme: Theme): string {
-    if (record.status === "running") return theme.fg("warning", "● ");
-    if (record.status === "queued") return theme.fg("muted", "○ ");
-    if (record.status === "completed" || record.status === "steered") return theme.fg("success", "✓ ");
-    if (record.status === "error") return theme.fg("error", "✗ ");
-    return theme.fg("dim", "■ ");
+    if (record.status === "running") return theme.fg("warning", "●");
+    if (record.status === "queued") return theme.fg("muted", "○");
+    if (record.status === "completed" || record.status === "steered") return theme.fg("success", "✓");
+    if (record.status === "error") return theme.fg("error", "✗");
+    return theme.fg("dim", "■");
   }
 }
