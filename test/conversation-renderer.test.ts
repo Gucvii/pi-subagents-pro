@@ -63,6 +63,43 @@ describe("conversation execution-flow renderer", () => {
     expect(output.indexOf("USER")).toBeLessThan(output.indexOf("ASSISTANT"));
   });
 
+  it("renders one ASSISTANT lane per turn across split assistant messages without reordering", () => {
+    const output = text(render([
+      { role: "user", content: "go" },
+      { role: "assistant", content: [{ type: "text", text: "before" }] },
+      { role: "assistant", content: [
+        { type: "thinking", thinking: "reason" },
+        { type: "toolCall", id: "split", name: "read", input: { path: "x" } },
+      ] },
+      { role: "toolResult", id: "split", content: [{ type: "text", text: "result" }] },
+      { role: "assistant", content: [{ type: "text", text: "final" }] },
+    ], true));
+    expect(output.match(/ASSISTANT/g)).toHaveLength(1);
+    expect(output.indexOf("before")).toBeLessThan(output.indexOf("reason"));
+    expect(output.indexOf("reason")).toBeLessThan(output.indexOf("READ"));
+    expect(output.indexOf("READ")).toBeLessThan(output.indexOf("result"));
+    expect(output.indexOf("result")).toBeLessThan(output.indexOf("final"));
+  });
+
+  it("keeps anomalous repeated users in one projected turn readable", () => {
+    const output = text(renderConversation({
+      omittedMessages: 0,
+      turns: [{
+        number: 1,
+        items: [
+          { kind: "user", parts: [{ kind: "text", text: "first user" }] },
+          { kind: "assistant", parts: [{ kind: "text", text: "first answer" }] },
+          { kind: "user", parts: [{ kind: "text", text: "second user" }] },
+          { kind: "assistant", parts: [{ kind: "text", text: "second answer" }] },
+        ],
+      }],
+    }, { width: 80, expanded: false, running: false, theme: theme() }));
+    expect(output.match(/USER/g)).toHaveLength(2);
+    expect(output.match(/ASSISTANT/g)).toHaveLength(1);
+    expect(output.indexOf("first user")).toBeLessThan(output.indexOf("second user"));
+    expect(output.indexOf("second user")).toBeLessThan(output.indexOf("second answer"));
+  });
+
   it("keeps thinking in order and folds it until Ctrl+O expands details", () => {
     const view = viewer([{ role: "user", content: "go" }, {
       role: "assistant",

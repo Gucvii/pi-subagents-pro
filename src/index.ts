@@ -726,6 +726,7 @@ export default function (pi: ExtensionAPI) {
         manager.getMaxTreeLevels(),
         ctx.getSystemPrompt?.(),
       );
+      fleet.setCurrentIdentity(lineage);
       parentSessionsByRoot.set(lineage.rootAgentId, ctx.sessionManager);
       parentSessionsById.set(ctx.sessionManager.getSessionId(), ctx.sessionManager);
       activationLineages.set(ctx.sessionManager.getSessionId(), { lineage, cwd: ctx.cwd });
@@ -804,6 +805,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_before_switch", () => {
+    fleet.onSessionBeforeSwitch();
     manager.clearCompleted(true);
     scheduler.stop();
     // Do not unregister the old root here: its background Agents keep running and

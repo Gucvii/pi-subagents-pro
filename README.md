@@ -8,7 +8,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 - **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `inspect_agent`, `read_agent_entry`, `get_subagent_result`, `steer_subagent`, `stop_agent`, `mailbox`)
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
-- **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
+- **FleetView** — a true trusted-lineage tree of `main` and every openable descendant across dynamically nested Agent managers. Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move through visible preorder, `←`/`→` to collapse, expand, or move between parent/child, `Enter` to open the correctly routed live conversation, and `Esc` to return. Finished agents linger briefly and an open viewer stays through completion. Toggle via `/agents → Settings → Fleet view`; the separate `/agents` roster is unchanged
 - **Structured conversation viewer** — select any agent in `/agents` to open a live-scrolling, color-aware overlay organized by user turns and execution flow. Assistant Markdown keeps headings, lists, and code blocks; thinking and long successful tool output start collapsed; tool calls pair with their results and use semantic running/success/error states. Use the configured `app.tools.expand` binding (`Ctrl+O` by default) to toggle bounded details. Steer with `Enter`, stop with `x` then `x`, scroll as before, and close with `Esc`
 - **Custom agent types** — define reusable prompts, tools, skills, isolation policy, and optional model/effort pins in project or global Markdown files
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -115,7 +115,7 @@ The token field is annotated with two optional signals inside parens:
 
 ### Conversation viewer
 
-Opening an Agent from `/agents` or FleetView shows a structured overlay rather than a flat message log. Each user message starts `── Turn N`; assistant prose uses Pi's public Markdown renderer, while thinking, tool arguments, and long successful outputs remain compact until the configured `app.tools.expand` binding (`Ctrl+O` by default). Failed tool/provider output is prominent and bounded, images show metadata without base64, and the header shows trusted lineage (`main › … › agent`), level, persistence, model, and effort. This phase changes only the opened-Agent overlay; it does **not** add or redesign a Fleet tree or `/agents` tree.
+Opening an Agent from `/agents` or FleetView shows a structured overlay rather than a flat message log. Each user message starts `── Turn N`; each turn prints the `ASSISTANT` lane heading once, while later assistant text, thinking, tools, results, and errors continue in their original order without repeated headings. Assistant prose uses Pi's public Markdown renderer, while thinking, tool arguments, and long successful outputs remain compact until the configured `app.tools.expand` binding (`Ctrl+O` by default). Failed tool/provider output is prominent and bounded, images show metadata without base64, and the header shows trusted lineage (`main › … › agent`), level, persistence, model, and effort.
 
 ### FleetView
 
@@ -124,13 +124,15 @@ While subagents are running, a Claude Code-style navigable list renders **below*
 ```
   esc to interrupt · ← for agents · ↓ to manage
 
-  ⏺ main
-  ◯ general-purpose  Sleep then report 1                                11s · ↓ 13.1k tokens
-  ◯ general-purpose  Sleep then report 2                                11s · ↓ 13.1k tokens
-                                                                                   ↓ 3 more
+  ⏺ ▾ main
+  ◯ ├─ ▾ ● running Research API (Explore)                                11s · ↓ 13.1k tokens
+  ◯ │  └─   ○ queued Check tests (worker)                                 2s · ↓ 0 tokens
+  ◯ └─   ✓ success Summarize findings (Plan)                              8s · ↓ 4.2k tokens
 ```
 
-The list is ordered earliest-launched first, and only shows agents you can actually open (pending/queued agents with no session yet appear once they start). At an **empty prompt**, press `↓` (or `←`) to move focus from the prompt into the list — the selected row is marked `⏺`, the rest `◯`. `↑`/`↓` move the selection, `Enter` opens the selected agent's live conversation overlay (it auto-updates as the agent works), and `Esc` (or `↑` above `main`) returns to the prompt. Selecting `main` returns to the normal view. Inside the overlay, press `Enter` to steer the running agent — type a message and `Enter` to send it (`Esc` or an empty submit returns), and it redirects the agent the same way the `steer_subagent` tool does. A viewer stays open when its agent finishes so you can read the final output, and finished agents linger in the list for a few seconds before dropping out. Typing anything at a non-empty prompt behaves normally — the list only captures arrow keys when the prompt is empty. Disable it entirely via `/agents → Settings → Fleet view`.
+FleetView is a real tree projected only from trusted `parentAgentId`/`rootAgentId`/`depth` lineage. It reads every live nested manager at display time, so a root Fleet can see grandchildren and routes open/steer/stop back to the manager that owns each record; it does not copy records or become another source of truth. Missing-parent deeper records are shown explicitly as orphans rather than attached to an invented parent. Siblings are ordered by launch time, then ID.
+
+Only agents with an openable session appear (queued agents without one appear once they start). At an **empty prompt**, press `↓` (or `←`) to activate the tree. `↑`/`↓` move through visible preorder. `←` collapses an expanded node, otherwise moves to its parent; on `main`, press it again after collapse to exit. `→` expands a collapsed node, otherwise enters its first child. `Enter` opens the selected live conversation and `Esc` exits. Inside the overlay, `Enter` steers and `x`, `x` stops through the selected agent's owning manager. A viewer stays open through completion, and finished agents linger for about four seconds. At most five visible agent nodes render at once, with the selected identity kept in view even as managers reorder or update. Every line is width-clamped. FleetView does not change the separate `/agents` roster. Disable it via `/agents → Settings → Fleet view`.
 
 Individual agent results render Claude Code-style in the conversation:
 
@@ -699,7 +701,10 @@ src/
   context.ts          # Parent conversation context for inherit_context
   env.ts              # Environment detection (git, platform)
   ui/
-    agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming
+    agent-widget.ts        # Persistent widget: spinners, activity, status icons, theming
+    fleet-list.ts          # Fleet tree interaction, windowing, and rendering
+    fleet-registry.ts      # Process-global live manager owner/routing registry
+    fleet-tree.ts          # Pure trusted-lineage tree projection
     conversation-viewer.ts # Live conversation overlay for viewing agent sessions
 ```
 

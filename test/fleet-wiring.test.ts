@@ -21,6 +21,7 @@ vi.mock("../src/agent-runner.js", async () => {
 
 import { runAgent } from "../src/agent-runner.js";
 import subagentsExtension from "../src/index.js";
+import { getFleetRegistrySizeForTests, resetFleetRegistryForTests } from "../src/ui/fleet-registry.js";
 
 function makePi() {
   const tools = new Map<string, any>();
@@ -80,6 +81,7 @@ describe("FleetView wiring (real extension lifecycle)", () => {
   let prevHome: string | undefined;
 
   beforeEach(() => {
+    resetFleetRegistryForTests();
     tmpDir = mkdtempSync(join(tmpdir(), "pi-fleet-"));
     agentDir = mkdtempSync(join(tmpdir(), "pi-fleet-agentdir-"));
     prevAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -105,6 +107,12 @@ describe("FleetView wiring (real extension lifecycle)", () => {
     vi.restoreAllMocks();
   });
 
+  it("does not register an activation that never receives session_start", () => {
+    const { pi } = makePi();
+    subagentsExtension(pi);
+    expect(getFleetRegistrySizeForTests()).toBe(0);
+  });
+
   it("captures terminal input on tool_execution_start (fleet hooked into the UI)", async () => {
     const { pi, lifecycle } = makePi();
     subagentsExtension(pi);
@@ -125,6 +133,8 @@ describe("FleetView wiring (real extension lifecycle)", () => {
     subagentsExtension(pi);
 
     const ui = uiCtx();
+    await lifecycle.get("session_start")?.({}, ctxWith(ui));
+    expect(getFleetRegistrySizeForTests()).toBe(1);
     await lifecycle.get("tool_execution_start")?.({}, ctxWith(ui)); // fleet captures THIS ui
 
     const spawn = await tools.get("Agent").execute(
@@ -142,5 +152,6 @@ describe("FleetView wiring (real extension lifecycle)", () => {
 
     await lifecycle.get("session_shutdown")?.({}, ctxWith(uiCtx()));
     expect(ui.setWidget).toHaveBeenCalledWith("fleet", undefined); // dispose cleared it
+    expect(getFleetRegistrySizeForTests()).toBe(0);
   });
 });

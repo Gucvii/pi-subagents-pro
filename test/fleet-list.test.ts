@@ -1,9 +1,9 @@
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
-import { getDisplayName } from "../src/ui/agent-widget.js";
 import { FleetList, type FleetUICtx, formatFleetElapsed, formatFleetTokens } from "../src/ui/fleet-list.js";
+import { getFleetRegistrySizeForTests, registerFleetOwner, resetFleetRegistryForTests } from "../src/ui/fleet-registry.js";
 
 // ---- Key sequences (see node_modules/@earendil-works/pi-tui/dist/keys.js) ----
 const DOWN = "\x1b[B";
@@ -17,12 +17,15 @@ const DOWN_RELEASE = "\x1b[1;1:3B";
 
 const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => `*${s}*` };
 
+beforeEach(() => resetFleetRegistryForTests());
+
 /** A no-op session so a record is "openable" by default (the list hides session-less agents). */
 const FAKE_SESSION = { subscribe: () => () => {}, messages: [] };
 
 function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
+  const id = over.id ?? "a1";
   return {
-    id: "a1",
+    id,
     type: "general-purpose",
     description: "Sleep then report 1",
     status: "running",
@@ -31,6 +34,7 @@ function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
     session: FAKE_SESSION as any,
     lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0 },
     compactionCount: 0,
+    lineage: { agentId: id, parentAgentId: "root", rootAgentId: "root", depth: 1, maxTreeLevels: 3 },
     ...over,
   } as AgentRecord;
 }
@@ -39,7 +43,7 @@ function makeRecord(over: Partial<AgentRecord> = {}): AgentRecord {
 function fakeManager(agents: AgentRecord[]): AgentManager {
   return {
     listAgents: () => agents,
-    abort: () => true,
+    abort: vi.fn(() => true),
     steer: vi.fn(() => true),
   } as unknown as AgentManager;
 }
@@ -94,6 +98,7 @@ function harness(agents: AgentRecord[]): Harness {
 
   const manager = fakeManager(agents);
   const fleet = new FleetList(manager, new Map());
+  fleet.setCurrentIdentity({ agentId: "root", rootAgentId: "root", depth: 0, maxTreeLevels: 3 });
   fleet.setUICtx(ui);
   fleet.update();
 
@@ -129,6 +134,30 @@ describe("formatFleetTokens", () => {
     expect(formatFleetTokens(13_100)).toBe("↓ 13.1k tokens");
     expect(formatFleetTokens(950)).toBe("↓ 950 tokens");
     expect(formatFleetTokens(1_200_000)).toBe("↓ 1.2M tokens");
+  });
+});
+
+describe("FleetList registry lifecycle", () => {
+  it("does not register before binding, registers once across switches, and disposes idempotently", () => {
+    const fleet = new FleetList(fakeManager([]), new Map());
+    expect(getFleetRegistrySizeForTests()).toBe(0);
+    fleet.setCurrentIdentity({ agentId: "A", rootAgentId: "A", depth: 0, maxTreeLevels: 3 });
+    expect(getFleetRegistrySizeForTests()).toBe(1);
+    fleet.onSessionBeforeSwitch();
+    expect(getFleetRegistrySizeForTests()).toBe(1);
+    fleet.setCurrentIdentity({ agentId: "B", rootAgentId: "B", depth: 0, maxTreeLevels: 3 });
+    fleet.onSessionBeforeSwitch();
+    fleet.setCurrentIdentity({ agentId: "C", rootAgentId: "C", depth: 0, maxTreeLevels: 3 });
+    expect(getFleetRegistrySizeForTests()).toBe(1);
+    fleet.dispose();
+    fleet.dispose();
+    expect(getFleetRegistrySizeForTests()).toBe(0);
+  });
+
+  it("refuses an invalid first identity without registering", () => {
+    const fleet = new FleetList(fakeManager([]), new Map());
+    fleet.setCurrentIdentity({ agentId: "", rootAgentId: "", depth: 0, maxTreeLevels: 0 });
+    expect(getFleetRegistrySizeForTests()).toBe(0);
   });
 });
 
@@ -186,11 +215,13 @@ describe("FleetList navigation", () => {
     expect(h.render().find(l => l.includes("one"))).toContain("◯");
   });
 
-  it("↑ above 'main' deactivates (returns to the prompt)", () => {
+  it("↑ clamps at main; ← collapses main then exits on a second press", () => {
     const h = harness([makeRecord()]);
-    h.press(DOWN); // activate, index 0
+    h.press(DOWN);
     expect(h.press(UP)).toEqual({ consume: true });
-    // back to inactive hint
+    expect(h.render().some(l => l.includes("enter view"))).toBe(true);
+    expect(h.press(LEFT)).toEqual({ consume: true });
+    expect(h.press(LEFT)).toEqual({ consume: true });
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
@@ -201,10 +232,12 @@ describe("FleetList navigation", () => {
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
-  it("passes non-nav keys through and cancels navigation", () => {
-    const h = harness([makeRecord()]);
+  it("uses → to enter the first child and passes non-nav keys through", () => {
+    const h = harness([makeRecord({ description: "child" })]);
     h.press(DOWN);
-    expect(h.press(RIGHT)).toBeUndefined();
+    expect(h.press(RIGHT)).toEqual({ consume: true });
+    expect(h.render().find(l => l.includes("child"))).toContain("⏺");
+    expect(h.press("z")).toBeUndefined();
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
@@ -222,6 +255,7 @@ describe("FleetList navigation", () => {
       const listAgents = vi.fn(() => agents);
       const manager = { listAgents, abort: () => true } as unknown as AgentManager;
       const fleet = new FleetList(manager, new Map());
+      fleet.setCurrentIdentity({ agentId: "root", rootAgentId: "root", depth: 0, maxTreeLevels: 3 });
       fleet.setUICtx({
         setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
         notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
@@ -292,7 +326,7 @@ describe("FleetList vs other focused components (#123)", () => {
 });
 
 describe("FleetList rendering", () => {
-  it("renders main + agent rows with model, effort, description and right-aligned stats", () => {
+  it("renders a low-noise status + description row with right-aligned stats", () => {
     const h = harness([makeRecord({
       description: "Sleep then report 1",
       invocation: { modelName: "opencode-go/deepseek-v4-flash", thinking: "max" },
@@ -303,8 +337,12 @@ describe("FleetList rendering", () => {
     expect(lines.find(l => l.includes("main"))).toContain("⏺"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("◯");
-    expect(agentLine).toContain(getDisplayName("general-purpose"));
-    expect(agentLine).toContain("deepseek-v4-flash · effort max");
+    expect(agentLine.indexOf("└─")).toBeLessThan(agentLine.indexOf("◯"));
+    expect(agentLine).toContain("●");
+    expect(agentLine).not.toContain("running");
+    expect(agentLine).not.toContain("(Agent)");
+    expect(agentLine).not.toContain("deepseek-v4-flash");
+    expect(agentLine).not.toContain("effort max");
     expect(agentLine).toContain("↓ 13.1k tokens");
     expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
   });
@@ -365,6 +403,52 @@ describe("FleetList rendering", () => {
 });
 
 describe("FleetList overlay lifecycle", () => {
+  it("renders a missing-parent orphan but never routes it to a manager", () => {
+    const orphan = makeRecord({
+      id: "orphan",
+      description: "untrusted orphan",
+      lineage: { agentId: "orphan", parentAgentId: "missing", rootAgentId: "root", depth: 2, maxTreeLevels: 3 },
+    });
+    const h = harness([orphan]);
+    expect(h.render().some(line => line.includes("untrusted orphan") && line.includes("orphan"))).toBe(true);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+    expect(h.overlayOpened()).toBe(false);
+    expect(h.manager.abort).not.toHaveBeenCalled();
+    expect(h.manager.steer).not.toHaveBeenCalled();
+  });
+
+  it("closes and isolates an old viewer across a session switch", async () => {
+    const agents = [makeRecord({ id: "A-child", description: "session A" })];
+    const h = harness(agents);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+    const oldViewer = h.overlayComponent()!;
+
+    h.fleet.onSessionBeforeSwitch();
+    expect(h.overlayClosed()).toBe(true);
+    agents.splice(0, 1, makeRecord({
+      id: "B-child",
+      description: "session B",
+      lineage: { agentId: "B-child", parentAgentId: "B", rootAgentId: "B", depth: 1, maxTreeLevels: 3 },
+    }));
+    h.fleet.setCurrentIdentity({ agentId: "B", rootAgentId: "B", depth: 0, maxTreeLevels: 3 });
+
+    oldViewer.handleInput("\r");
+    for (const ch of "stale") oldViewer.handleInput(ch);
+    oldViewer.handleInput("\r");
+    oldViewer.handleInput("x");
+    oldViewer.handleInput("x");
+    await Promise.resolve(); // old custom().then must not reset B's selection/state
+
+    expect(h.manager.steer).not.toHaveBeenCalled();
+    expect(h.manager.abort).not.toHaveBeenCalled();
+    expect(h.render().some(line => line.includes("session A"))).toBe(false);
+    expect(h.render().some(line => line.includes("session B"))).toBe(true);
+  });
+
   it("Enter on 'main' just deactivates (no overlay)", () => {
     const h = harness([makeRecord()]);
     h.press(DOWN); // active, index 0 (main)
@@ -391,6 +475,40 @@ describe("FleetList overlay lifecycle", () => {
     // Selection follows a2 ("two") to its new position, not whatever is at idx 2 now.
     expect(h.render().find(l => l.includes("two"))).toContain("⏺");
     expect(h.render().find(l => l.includes("three"))).toContain("◯");
+  });
+
+  it("routes cross-owner grandchild open, steer, and abort to its manager", () => {
+    const child = makeRecord({ id: "child", description: "child" });
+    const grand = makeRecord({
+      id: "grand",
+      description: "grand",
+      lineage: { agentId: "grand", parentAgentId: "child", rootAgentId: "root", depth: 2, maxTreeLevels: 3 },
+    });
+    const childManager = fakeManager([grand]);
+    const abort = vi.fn(() => true);
+    (childManager as any).abort = abort;
+    registerFleetOwner({
+      owner: childManager,
+      listAgents: () => childManager.listAgents(),
+      getActivity: () => undefined,
+      abort: (id) => childManager.abort(id),
+      steer: (id, message) => childManager.steer(id, message),
+    });
+    const h = harness([child]);
+    h.press(DOWN);  // activate main
+    h.press(RIGHT); // enter child
+    h.press(RIGHT); // enter grandchild
+    h.press(ENTER);
+    const viewer = h.overlayComponent();
+    expect(viewer).toBeDefined();
+    viewer!.handleInput("\r");
+    for (const ch of "redirect") viewer!.handleInput(ch);
+    viewer!.handleInput("\r");
+    expect(childManager.steer).toHaveBeenCalledWith("grand", "redirect");
+    viewer!.handleInput("x");
+    viewer!.handleInput("x");
+    expect(abort).toHaveBeenCalledWith("grand");
+    expect(h.manager.steer).not.toHaveBeenCalled();
   });
 
   it("wires the viewer's steer composer to manager.steer with the agent id", () => {

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveAgentDescription, formatPromptPreview, renderAgentCallCard, renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
-import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatInvocationIdentity, formatSessionTokens } from "../src/ui/agent-widget.js";
+import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatInvocationIdentity, formatSessionTokens, formatTurns } from "../src/ui/agent-widget.js";
 
 describe("formatSessionTokens", () => {
   const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => s };
@@ -39,6 +39,13 @@ describe("formatSessionTokens", () => {
     expect(fgPreservingNestedStyles(ansiTheme, "accent", tokenText)).toBe(
       "\u001b[35m1.2k token (\u001b[33m70%\u001b[39m\u001b[35m)\u001b[39m",
     );
+  });
+});
+
+describe("formatTurns", () => {
+  it("separates the turn glyph from the first digit", () => {
+    expect(formatTurns(9, 100)).toBe("↻ 9≤100");
+    expect(formatTurns(9)).toBe("↻ 9");
   });
 });
 

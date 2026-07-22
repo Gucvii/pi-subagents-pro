@@ -493,6 +493,7 @@ export function renderConversation(projection: ConversationProjection, options: 
       if (lines.length > 0) lines.push("");
       lines.push(theme.fg("dim", `── Turn ${turn.number}`));
     }
+    let assistantLaneRendered = false;
     for (const item of turn.items) {
       if (item.kind === "user") {
         lines.push(theme.bold(theme.fg("accent", "USER")));
@@ -501,7 +502,10 @@ export function renderConversation(projection: ConversationProjection, options: 
           else lines.push(...safeWrap(part.text, width).map((line) => theme.fg("userMessageText", line)));
         }
       } else if (item.kind === "assistant") {
-        lines.push(theme.bold(theme.fg("accent", "ASSISTANT")));
+        if (!assistantLaneRendered) {
+          lines.push(theme.bold(theme.fg("accent", "ASSISTANT")));
+          assistantLaneRendered = true;
+        }
         for (const part of item.parts) {
           if (part.kind === "text") lines.push(...markdownLines(part.text, width, theme));
           else if (part.kind === "image") lines.push(renderImage(part, theme));
