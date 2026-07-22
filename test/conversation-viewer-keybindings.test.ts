@@ -101,6 +101,19 @@ describe("viewer-keys", () => {
     expect(keys.scrollUp(CTRL_P)).toBe(true);
     expect(keys.scrollUp(UP)).toBe(false);
   });
+
+  it("makes the manager authoritative for details and rejects the removed Ctrl+O default", () => {
+    const manager: ViewerKeybindings = {
+      matches: (data, binding) => binding === "app.tools.expand" && data === "configured-expand",
+    };
+    const keys = createViewerKeys(manager);
+    expect(keys.toggleDetails("\x0f")).toBe(false);
+    expect(keys.toggleDetails("configured-expand")).toBe(true);
+  });
+
+  it("falls back to Ctrl+O for details only when no manager exists", () => {
+    expect(createViewerKeys().toggleDetails("\x0f")).toBe(true);
+  });
 });
 
 describe("ConversationViewer custom keybindings", () => {
@@ -136,5 +149,20 @@ describe("ConversationViewer custom keybindings", () => {
     expect(scrollOffset(viewer)).toBe(bottom);
     viewer.handleInput(UP);
     expect(scrollOffset(viewer)).toBe(bottom - 1);
+  });
+
+  it("rejects Ctrl+O and accepts the configured details key in the viewer", () => {
+    const manager: ViewerKeybindings = {
+      matches: (data, binding) => binding === "app.tools.expand" && data === "configured-expand",
+    };
+    const viewer = createViewer(manager);
+    viewer.handleInput("\x0f");
+    expect((viewer as any).expanded).toBe(false);
+    viewer.handleInput("configured-expand");
+    expect((viewer as any).expanded).toBe(true);
+  });
+
+  it("safely falls back when the test environment has no global app binding", () => {
+    expect(createViewer().render(100).join("\n")).toContain("Ctrl+O details");
   });
 });

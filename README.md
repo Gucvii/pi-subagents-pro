@@ -9,7 +9,7 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
 - **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
 - **FleetView** — Claude Code-style navigable list of `main` + every running subagent rendered below the editor (earliest-launched first). Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move the selection, `Enter` to open the selected agent's live, auto-updating conversation, `Esc` to return. Finished agents linger briefly before dropping out, and a viewer stays open through completion so you can read the final output. Toggle via `/agents → Settings → Fleet view`
-- **Conversation viewer** — select any agent in `/agents` to open a live-scrolling overlay of its full conversation (auto-follows new content, scroll up to pause). Steer a running agent inline by pressing `Enter` to open a composer, typing, then `Enter` to send (`Esc` or an empty submit returns) — the message appears as a user message and redirects the agent after its current tool. Stop a still-running agent by pressing `x` (then `x` again to confirm) — both work for background agents too
+- **Structured conversation viewer** — select any agent in `/agents` to open a live-scrolling, color-aware overlay organized by user turns and execution flow. Assistant Markdown keeps headings, lists, and code blocks; thinking and long successful tool output start collapsed; tool calls pair with their results and use semantic running/success/error states. Use the configured `app.tools.expand` binding (`Ctrl+O` by default) to toggle bounded details. Steer with `Enter`, stop with `x` then `x`, scroll as before, and close with `Esc`
 - **Custom agent types** — define reusable prompts, tools, skills, isolation policy, and optional model/effort pins in project or global Markdown files
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
 - **Session resume** — pick up where an agent left off, preserving full conversation context
@@ -112,6 +112,10 @@ The extension renders a persistent widget above the editor showing active agents
 The token field is annotated with two optional signals inside parens:
 - **`NN%`** — context-window utilization (color-coded: <70% dim, 70–85% warning, ≥85% error). Omitted when the model has no declared `contextWindow`, or briefly right after compaction.
 - **`⇊N`** — number of times the session has compacted, when > 0. Stays dim; the percent's color carries urgency.
+
+### Conversation viewer
+
+Opening an Agent from `/agents` or FleetView shows a structured overlay rather than a flat message log. Each user message starts `── Turn N`; assistant prose uses Pi's public Markdown renderer, while thinking, tool arguments, and long successful outputs remain compact until the configured `app.tools.expand` binding (`Ctrl+O` by default). Failed tool/provider output is prominent and bounded, images show metadata without base64, and the header shows trusted lineage (`main › … › agent`), level, persistence, model, and effort. This phase changes only the opened-Agent overlay; it does **not** add or redesign a Fleet tree or `/agents` tree.
 
 ### FleetView
 

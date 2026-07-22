@@ -5,13 +5,13 @@
  * Subscribes to session events for real-time streaming updates.
  */
 
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { extractText } from "../context.js";
+import { type AgentSession, keyText } from "@earendil-works/pi-coding-agent";
+import { type Component, Input, matchesKey, type TUI, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentRecord } from "../types.js";
 import { getLifetimeTotal, getSessionContextPercent } from "../usage.js";
 import type { Theme } from "./agent-widget.js";
 import { type AgentActivity, buildInvocationTags, describeActivity, fgPreservingNestedStyles, formatDuration, formatSessionTokens, formatStorageBytes, getAgentSessionStorage, getDisplayName, getPromptModeLabel } from "./agent-widget.js";
+import { type ConversationProjection, projectConversation, renderConversation, sanitizeSingleLineText, sanitizeTerminalText } from "./conversation-renderer.js";
 import { createViewerKeys, type ViewerKeybindings, type ViewerKeys } from "./viewer-keys.js";
 
 /** Base lines consumed by chrome: top border + header + header sep + footer sep + footer + bottom border. */
@@ -20,9 +20,94 @@ const MIN_VIEWPORT = 3;
 /** Height ceiling shared by the overlay's `maxHeight` and the viewer's internal viewport cap. */
 export const VIEWPORT_HEIGHT_PCT = 70;
 
+function safeDisplay(value: string, maxChars = 1000): string {
+  return sanitizeSingleLineText(value.slice(0, maxChars));
+}
+
+const TURN_MARKER = /^──\s+Turn\s+(\d+)$/i;
+const ANCHOR_CONTEXT_RADIUS = 12;
+const ANCHOR_CONTEXT_CHARS = 160;
+
+type TurnAnchor = {
+  turnNumber: number;
+  lineInTurn: number;
+  fractionInTurn: number;
+  turnSpan: number;
+  context?: string;
+  contextDelta: number;
+};
+
+type TurnRange = { start: number; end: number; number: number };
+
+function normalizedAnchorLine(line: string): string {
+  return sanitizeTerminalText(line)
+    .trim()
+    .replace(/\s+/g, " ")
+    .slice(0, ANCHOR_CONTEXT_CHARS)
+    .toLocaleLowerCase();
+}
+
+function turnNumberAt(line: string): number | undefined {
+  const match = TURN_MARKER.exec(normalizedAnchorLine(line));
+  return match ? Number(match[1]) : undefined;
+}
+
+function findTurnRange(lines: string[], turnNumber: number): TurnRange | undefined {
+  let start = -1;
+  for (let index = 0; index < lines.length; index++) {
+    const number = turnNumberAt(lines[index] ?? "");
+    if (number === turnNumber) start = index;
+    else if (start >= 0 && number !== undefined) return { start, end: index, number: turnNumber };
+  }
+  return start >= 0 ? { start, end: lines.length, number: turnNumber } : undefined;
+}
+
+function isGenericAnchorLine(line: string): boolean {
+  if (!line || TURN_MARKER.test(line)) return true;
+  return /^(?:user|assistant|├─ thinking\b|└─ provider error\b|branch summary\s*·|compaction\s*·|custom\s*·|│\s*arguments$|│\s*\[collapsed\]|\[conversation truncated\b|\[\d+ older messages omitted\b)/.test(line);
+}
+
+function captureTurnAnchor(lines: string[], top: number): TurnAnchor | undefined {
+  let range: TurnRange | undefined;
+  for (let index = Math.min(top, lines.length - 1); index >= 0; index--) {
+    const number = turnNumberAt(lines[index] ?? "");
+    if (number !== undefined) {
+      range = findTurnRange(lines, number);
+      break;
+    }
+  }
+  if (!range || top >= range.end) return undefined;
+
+  const lineInTurn = Math.max(0, top - range.start);
+  const turnSpan = Math.max(1, range.end - range.start - 1);
+  let context: string | undefined;
+  let contextDelta = 0;
+  for (let distance = 0; distance <= ANCHOR_CONTEXT_RADIUS && !context; distance++) {
+    const candidates = distance === 0 ? [top] : [top + distance, top - distance];
+    for (const index of candidates) {
+      if (index < range.start || index >= range.end) continue;
+      const normalized = normalizedAnchorLine(lines[index] ?? "");
+      if (!isGenericAnchorLine(normalized)) {
+        context = normalized;
+        contextDelta = index - top;
+        break;
+      }
+    }
+  }
+  return { turnNumber: range.number, lineInTurn, fractionInTurn: lineInTurn / turnSpan, turnSpan, context, contextDelta };
+}
+
 export class ConversationViewer implements Component {
   private scrollOffset = 0;
   private autoScroll = true;
+  /** Immutable rendered lines while the reader is away from live follow. */
+  private pausedContentLines: string[] | undefined;
+  private pausedProjection: ConversationProjection | undefined;
+  private pausedLiveActivity: string | undefined;
+  private pausedRunning = false;
+  /** Width used to produce pausedContentLines; resize reflows the frozen projection. */
+  private pausedRenderWidth: number | undefined;
+  private hasKeybindingsManager = false;
   private unsubscribe: (() => void) | undefined;
   private lastInnerW = 0;
   private closed = false;
@@ -31,6 +116,8 @@ export class ConversationViewer implements Component {
   private keys: ViewerKeys;
   /** Steering composer — present while the user is typing a message to the agent. */
   private composer: Input | undefined;
+  /** Global detail state for thinking, tool arguments, and long outputs. */
+  private expanded = false;
 
   constructor(
     private tui: TUI,
@@ -46,6 +133,7 @@ export class ConversationViewer implements Component {
     /** Send a steering message to the agent. Omitted → no compose affordance. */
     private onSteer?: (message: string) => void,
   ) {
+    this.hasKeybindingsManager = keybindings !== undefined;
     this.keys = createViewerKeys(keybindings);
     this.unsubscribe = session.subscribe(() => {
       if (this.closed) return;
@@ -58,6 +146,14 @@ export class ConversationViewer implements Component {
     // Esc cancels — both wired in openComposer()). Editing keys flow through.
     if (this.composer) {
       this.composer.handleInput(data);
+      this.tui.requestRender();
+      return;
+    }
+
+    if (this.keys.toggleDetails(data)) {
+      this.expanded = !this.expanded;
+      if (!this.autoScroll) this.rerenderPausedWithAnchor();
+      this.stopArmed = false;
       this.tui.requestRender();
       return;
     }
@@ -93,28 +189,27 @@ export class ConversationViewer implements Component {
     }
     if (this.stopArmed) this.stopArmed = false;
 
-    const totalLines = this.buildContentLines(this.lastInnerW).length;
+    const contentLines = this.buildContentLines(this.lastInnerW);
     const viewportHeight = this.viewportHeight();
-    const maxScroll = Math.max(0, totalLines - viewportHeight);
+    const maxScroll = Math.max(0, contentLines.length - viewportHeight);
 
     if (this.keys.scrollUp(data)) {
+      if (maxScroll > 0) this.pause(contentLines);
       this.scrollOffset = Math.max(0, this.scrollOffset - 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
     } else if (this.keys.scrollDown(data)) {
       this.scrollOffset = Math.min(maxScroll, this.scrollOffset + 1);
-      this.autoScroll = this.scrollOffset >= maxScroll;
+      if (!this.autoScroll && this.scrollOffset >= maxScroll) this.resumeLiveFollow();
     } else if (this.keys.pageUp(data)) {
+      if (maxScroll > 0) this.pause(contentLines);
       this.scrollOffset = Math.max(0, this.scrollOffset - viewportHeight);
-      this.autoScroll = false;
     } else if (this.keys.pageDown(data)) {
       this.scrollOffset = Math.min(maxScroll, this.scrollOffset + viewportHeight);
-      this.autoScroll = this.scrollOffset >= maxScroll;
+      if (!this.autoScroll && this.scrollOffset >= maxScroll) this.resumeLiveFollow();
     } else if (matchesKey(data, "home")) {
+      if (maxScroll > 0) this.pause(contentLines);
       this.scrollOffset = 0;
-      this.autoScroll = false;
     } else if (matchesKey(data, "end")) {
-      this.scrollOffset = maxScroll;
-      this.autoScroll = true;
+      this.resumeLiveFollow();
     }
   }
 
@@ -122,6 +217,7 @@ export class ConversationViewer implements Component {
     if (width < 6) return []; // too narrow for any meaningful rendering
     const th = this.theme;
     const innerW = width - 4; // border + padding
+    if (!this.autoScroll && this.pausedRenderWidth !== innerW) this.rerenderPausedWithAnchor(innerW);
     this.lastInnerW = innerW;
     const lines: string[] = [];
 
@@ -137,9 +233,18 @@ export class ConversationViewer implements Component {
 
     // Header
     lines.push(hrTop);
-    const name = getDisplayName(this.record.type);
+    const name = safeDisplay(getDisplayName(this.record.type), 200);
+    // Legacy/in-memory test records may predate persisted lineage. Such records
+    // are direct children; never invent an ancestor name.
+    const lineage = this.record.lineage ?? { depth: 1, parentAgentId: undefined };
+    const parentCrumb = lineage.depth >= 2 && lineage.parentAgentId
+      ? safeDisplay(lineage.parentAgentId, 8)
+      : undefined;
+    const breadcrumb = ["main", lineage.depth >= 3 ? "…" : undefined, parentCrumb, name].filter(Boolean).join(" › ");
+    const levelTag = `L${lineage.depth + 1}`;
+    const persistenceTag = this.record.invocation?.sessionPersistence ?? "durable";
     const modeLabel = getPromptModeLabel(this.record.type);
-    const modeTag = modeLabel ? ` ${th.fg("dim", `(${modeLabel})`)}` : "";
+    const modeTag = modeLabel ? ` ${th.fg("dim", `(${safeDisplay(modeLabel, 100)})`)}` : "";
     const statusIcon = this.record.status === "running"
       ? th.fg("accent", "●")
       : this.record.status === "completed"
@@ -159,7 +264,7 @@ export class ConversationViewer implements Component {
     }
 
     lines.push(row(
-      `${statusIcon} ${th.bold(name)}${modeTag}  ${th.fg("muted", this.record.description)} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", headerParts.join(" · "))}`,
+      `${statusIcon} ${th.bold(breadcrumb)}${modeTag} ${th.fg("dim", `${levelTag} · ${safeDisplay(persistenceTag, 100)}`)}  ${th.fg("muted", safeDisplay(this.record.description))} ${th.fg("dim", "·")} ${fgPreservingNestedStyles(th, "dim", safeDisplay(headerParts.join(" · "), 2000))}`,
     ));
     const invocationLine = this.invocationLine();
     if (invocationLine) lines.push(row(invocationLine));
@@ -191,27 +296,32 @@ export class ConversationViewer implements Component {
       const composeGap = Math.max(1, innerW - visibleWidth(composeLeft) - visibleWidth(composeHint));
       lines.push(row(composeLeft + " ".repeat(composeGap) + composeHint));
     } else {
-      // Actions on the left, navigation on the right. The scroll hint keeps its
-      // full key list so the less-obvious bindings stay discoverable; it leads
-      // the right group so "Esc close" is the only part that truncates first.
+      // Actions stay on the left. Navigation compacts before any core action is
+      // removed, and the optional line count is always the first thing dropped.
       const sep = th.fg("dim", " · ");
-      const actions: string[] = [];
+      const actions: string[] = [th.fg("dim", `${this.detailsKeyText()} ${this.expanded ? "collapse" : "details"}`)];
+      if (!this.autoScroll) actions.push(th.fg("warning", "paused"));
       if (this.canSteer()) actions.push(th.fg("dim", "Enter steer"));
       if (this.isStoppable()) {
         actions.push(this.stopArmed ? th.fg("error", "x again to STOP") : th.fg("dim", "x stop"));
       }
-      const footerRight = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
+      const verboseNavigation = th.fg("dim", "↑↓ scroll · PgUp/PgDn or Shift+↑↓ · Esc close");
+      const compactNavigation = th.fg("dim", "↑↓/Pg scroll · Esc close");
+      const actionHints = actions.join(sep);
+      const footerRight = visibleWidth(actionHints) + visibleWidth(verboseNavigation) + 1 <= innerW
+        ? verboseNavigation
+        : compactNavigation;
 
       // Prepend the line-count/scroll-% readout only when there's spare width —
-      // it's the first thing dropped so it never crowds out the hints.
+      // it's the first thing dropped so it never crowds out the core actions.
       const scrollPct = contentLines.length <= viewportHeight
         ? "100%"
         : `${Math.round(((visibleStart + viewportHeight) / contentLines.length) * 100)}%`;
       const count = th.fg("dim", `${contentLines.length} lines · ${scrollPct}`);
-      const withCount = [count, ...actions].join(sep);
+      const withCount = [count, actionHints].join(sep);
       const footerLeft = visibleWidth(withCount) + visibleWidth(footerRight) + 1 <= innerW
         ? withCount
-        : actions.join(sep);
+        : actionHints;
 
       const footerGap = Math.max(1, innerW - visibleWidth(footerLeft) - visibleWidth(footerRight));
       lines.push(row(footerLeft + " ".repeat(footerGap) + footerRight));
@@ -249,7 +359,9 @@ export class ConversationViewer implements Component {
     this.tui.requestRender();
   }
 
-  invalidate(): void { /* no cached state to clear */ }
+  invalidate(): void {
+    if (!this.autoScroll) this.rerenderPausedWithAnchor();
+  }
 
   dispose(): void {
     this.closed = true;
@@ -275,91 +387,122 @@ export class ConversationViewer implements Component {
 
   private invocationLine(): string | undefined {
     const { modelName, tags } = buildInvocationTags(this.record.invocation);
-    const parts = modelName ? [modelName, ...tags] : tags;
+    const parts = (modelName ? [modelName, ...tags] : tags).map((part) => safeDisplay(part));
     const storage = getAgentSessionStorage(this.record);
     if (storage.sizeBytes != null) parts.push(formatStorageBytes(storage.sizeBytes));
-    if (storage.path) parts.push(storage.path);
+    if (storage.path) parts.push(safeDisplay(storage.path, 2000));
     if (parts.length === 0) return undefined;
     return this.theme.fg("dim", `  ↳ ${parts.join(" · ")}`);
   }
 
   private buildContentLines(width: number): string[] {
+    if (!this.autoScroll && this.pausedContentLines) return this.pausedContentLines;
+    return this.buildLiveContentLines(width);
+  }
+
+  private buildLiveContentLines(width: number): string[] {
+    return this.renderProjection(
+      projectConversation(this.session.messages),
+      width,
+      this.record.status === "running",
+      this.currentLiveActivity(),
+    );
+  }
+
+  private renderProjection(projection: ConversationProjection, width: number, running: boolean, liveActivity?: string): string[] {
     if (width <= 0) return [];
+    return renderConversation(projection, {
+      width,
+      expanded: this.expanded,
+      running,
+      theme: this.theme,
+      liveActivity,
+    });
+  }
 
-    const th = this.theme;
-    const messages = this.session.messages;
-    const lines: string[] = [];
+  private currentLiveActivity(): string | undefined {
+    return this.record.status === "running" && this.activity
+      ? describeActivity(this.activity.activeTools, this.activity.responseText)
+      : undefined;
+  }
 
-    if (messages.length === 0) {
-      lines.push(th.fg("dim", "(waiting for first message...)"));
-      return lines;
-    }
+  private pause(lines: string[]): void {
+    if (!this.autoScroll) return;
+    this.autoScroll = false;
+    this.pausedProjection = projectConversation(this.session.messages);
+    this.pausedRunning = this.record.status === "running";
+    this.pausedLiveActivity = this.currentLiveActivity();
+    this.pausedContentLines = lines.slice();
+    this.pausedRenderWidth = this.lastInnerW;
+  }
 
-    let needsSeparator = false;
-    for (const msg of messages) {
-      if (msg.role === "user") {
-        const text = typeof msg.content === "string"
-          ? msg.content
-          : extractText(msg.content);
-        if (!text.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("accent", "[User]"));
-        for (const line of wrapTextWithAnsi(text.trim(), width)) {
-          lines.push(line);
-        }
-      } else if (msg.role === "assistant") {
-        const textParts: string[] = [];
-        const toolCalls: string[] = [];
-        for (const c of msg.content) {
-          if (c.type === "text" && c.text) textParts.push(c.text);
-          else if (c.type === "toolCall") {
-            toolCalls.push((c as any).name ?? (c as any).toolName ?? "unknown");
+  private resumeLiveFollow(): void {
+    this.autoScroll = true;
+    this.pausedContentLines = undefined;
+    this.pausedProjection = undefined;
+    this.pausedLiveActivity = undefined;
+    this.pausedRunning = false;
+    this.pausedRenderWidth = undefined;
+    const live = this.buildLiveContentLines(this.lastInnerW);
+    this.scrollOffset = Math.max(0, live.length - this.viewportHeight());
+  }
+
+  private rerenderPausedWithAnchor(width = this.lastInnerW): void {
+    const oldLines = this.pausedContentLines;
+    if (!oldLines) return;
+    const viewportHeight = this.viewportHeight();
+    const oldOffset = Math.min(this.scrollOffset, Math.max(0, oldLines.length - viewportHeight));
+    const anchor = captureTurnAnchor(oldLines, oldOffset);
+    const next = this.pausedProjection
+      ? this.renderProjection(this.pausedProjection, width, this.pausedRunning, this.pausedLiveActivity)
+      : oldLines.slice();
+    let nextOffset = Math.min(oldOffset, Math.max(0, next.length - viewportHeight));
+    const nextTurn = anchor ? findTurnRange(next, anchor.turnNumber) : undefined;
+    if (anchor && nextTurn) {
+      const nextSpan = Math.max(1, nextTurn.end - nextTurn.start - 1);
+      const fallbackLine = nextSpan === anchor.turnSpan
+        ? anchor.lineInTurn
+        : Math.round(anchor.fractionInTurn * nextSpan);
+      nextOffset = nextTurn.start + Math.min(nextSpan, fallbackLine);
+
+      if (anchor.context) {
+        const expectedContext = nextOffset + anchor.contextDelta;
+        let bestIndex = -1;
+        let bestQuality = -1;
+        let bestDistance = Number.POSITIVE_INFINITY;
+        // Deliberately search only inside the captured Turn. Repeated USER,
+        // ASSISTANT, THINKING, and branch structure in other Turns is irrelevant.
+        for (let index = nextTurn.start; index < nextTurn.end; index++) {
+          const candidate = normalizedAnchorLine(next[index] ?? "");
+          if (isGenericAnchorLine(candidate)) continue;
+          const quality = candidate === anchor.context
+            ? 3
+            : candidate.length >= 4 && (candidate.startsWith(anchor.context) || anchor.context.startsWith(candidate))
+              ? 2
+              : candidate.length >= 4 && (candidate.includes(anchor.context) || anchor.context.includes(candidate)) ? 1 : 0;
+          if (quality === 0) continue;
+          const distance = Math.abs(index - expectedContext);
+          if (quality > bestQuality || (quality === bestQuality && distance < bestDistance)) {
+            bestIndex = index;
+            bestQuality = quality;
+            bestDistance = distance;
           }
         }
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.bold("[Assistant]"));
-        if (textParts.length > 0) {
-          for (const line of wrapTextWithAnsi(textParts.join("\n").trim(), width)) {
-            lines.push(line);
-          }
-        }
-        for (const name of toolCalls) {
-          lines.push(truncateToWidth(th.fg("muted", `  [Tool: ${name}]`), width));
-        }
-      } else if (msg.role === "toolResult") {
-        const text = extractText(msg.content);
-        const truncated = text.length > 500 ? text.slice(0, 500) + "... (truncated)" : text;
-        if (!truncated.trim()) continue;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(th.fg("dim", "[Result]"));
-        for (const line of wrapTextWithAnsi(truncated.trim(), width)) {
-          lines.push(th.fg("dim", line));
-        }
-      } else if ((msg as any).role === "bashExecution") {
-        const bash = msg as any;
-        if (needsSeparator) lines.push(th.fg("dim", "───"));
-        lines.push(truncateToWidth(th.fg("muted", `  $ ${bash.command}`), width));
-        if (bash.output?.trim()) {
-          const out = bash.output.length > 500
-            ? bash.output.slice(0, 500) + "... (truncated)"
-            : bash.output;
-          for (const line of wrapTextWithAnsi(out.trim(), width)) {
-            lines.push(th.fg("dim", line));
-          }
-        }
-      } else {
-        continue;
+        if (bestIndex >= 0) nextOffset = bestIndex - anchor.contextDelta;
       }
-      needsSeparator = true;
+      nextOffset = Math.max(nextTurn.start, Math.min(nextOffset, nextTurn.end - 1));
     }
+    this.pausedContentLines = next;
+    this.pausedRenderWidth = width;
+    this.scrollOffset = Math.min(nextOffset, Math.max(0, next.length - viewportHeight));
+  }
 
-    // Streaming indicator for running agents
-    if (this.record.status === "running" && this.activity) {
-      const act = describeActivity(this.activity.activeTools, this.activity.responseText);
-      lines.push("");
-      lines.push(truncateToWidth(th.fg("accent", "▍ ") + th.fg("dim", act), width));
+  private detailsKeyText(): string {
+    try {
+      const configured = safeDisplay(keyText("app.tools.expand"), 100).trim();
+      return configured || (this.hasKeybindingsManager ? "unbound" : "Ctrl+O");
+    } catch {
+      return "Ctrl+O";
     }
-
-    return lines.map(l => truncateToWidth(l, width));
   }
 }
