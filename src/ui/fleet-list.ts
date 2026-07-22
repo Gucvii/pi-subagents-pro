@@ -383,11 +383,11 @@ export class FleetList {
 
     const prefix = entry.ancestorContinues.map(continues => continues ? "│  " : "   ").join("") + (entry.isLast ? "└─ " : "├─ ");
     const record = node.handle!.record;
-    const status = this.statusPresentation(record, theme);
     const orphan = node.orphan ? theme.fg("warning", " orphan") : "";
     const displayType = getDisplayName(record.type);
     const type = displayType === "Agent" ? "" : theme.fg("dim", ` (${displayType})`);
-    const left = `  ${prefix}${bullet} ${disclosure} ${status} ${theme.bold(record.description)}${type}${orphan}`;
+    const description = this.descriptionPresentation(record, theme);
+    const left = `  ${prefix}${bullet} ${disclosure} ${description}${type}${orphan}`;
     const activity = this.safeActivity(node.handle!.provider, record.id);
     const tokens = getLifetimeTotal(activity?.lifetimeUsage ?? record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -399,11 +399,16 @@ export class FleetList {
     try { return provider.getActivity(agentId); } catch { return undefined; }
   }
 
-  private statusPresentation(record: AgentRecord, theme: Theme): string {
-    if (record.status === "running") return theme.fg("warning", "●");
-    if (record.status === "queued") return theme.fg("muted", "○");
-    if (record.status === "completed" || record.status === "steered") return theme.fg("success", "✓");
-    if (record.status === "error") return theme.fg("error", "✗");
-    return theme.fg("dim", "■");
+  private descriptionPresentation(record: AgentRecord, theme: Theme): string {
+    const color = record.status === "queued"
+      ? "muted"
+      : record.status === "completed" || record.status === "steered"
+        ? "success"
+        : record.status === "error"
+          ? "error"
+          : record.status === "running"
+            ? "text"
+            : "dim";
+    return theme.bold(theme.fg(color, record.description));
   }
 }

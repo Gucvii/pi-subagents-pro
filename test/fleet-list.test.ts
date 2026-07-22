@@ -338,7 +338,7 @@ describe("FleetList rendering", () => {
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("◯");
     expect(agentLine.indexOf("└─")).toBeLessThan(agentLine.indexOf("◯"));
-    expect(agentLine).toContain("●");
+    expect(agentLine).not.toMatch(/[●✓✗■]/);
     expect(agentLine).not.toContain("running");
     expect(agentLine).not.toContain("(Agent)");
     expect(agentLine).not.toContain("deepseek-v4-flash");

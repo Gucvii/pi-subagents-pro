@@ -125,9 +125,9 @@ While subagents are running, a Claude Code-style navigable list renders **below*
   esc to interrupt · ← for agents · ↓ to manage
 
   ⏺ ▾ main
-  ◯ ├─ ▾ ● running Research API (Explore)                                11s · ↓ 13.1k tokens
-  ◯ │  └─   ○ queued Check tests (worker)                                 2s · ↓ 0 tokens
-  ◯ └─   ✓ success Summarize findings (Plan)                              8s · ↓ 4.2k tokens
+  ├─ ◯ ▾ Research API (Explore)                                      11s · ↓ 13.1k tokens
+  │  └─ ◯   Check tests (worker)                                      2s · ↓ 0 tokens
+  └─ ◯   Summarize findings (Plan)                                    8s · ↓ 4.2k tokens
 ```
 
 FleetView is a real tree projected only from trusted `parentAgentId`/`rootAgentId`/`depth` lineage. It reads every live nested manager at display time, so a root Fleet can see grandchildren and routes open/steer/stop back to the manager that owns each record; it does not copy records or become another source of truth. Missing-parent deeper records are shown explicitly as orphans rather than attached to an invented parent. Siblings are ordered by launch time, then ID.
