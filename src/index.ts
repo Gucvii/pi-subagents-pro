@@ -59,6 +59,13 @@ import {
   type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx } from "./ui/fleet-list.js";
+import {
+  type FleetOwnerProvider,
+  listFleetAgentHandles,
+  publishFleetRecordChanged,
+  publishFleetRecordRemoved,
+  subscribeFleetRegistry,
+} from "./ui/fleet-registry.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
 import { addUsage, getLifetimeTotal, getSessionContextPercent, type LifetimeUsage } from "./usage.js";
 
@@ -615,6 +622,10 @@ export default function (pi: ExtensionAPI) {
       compactionCount: record.compactionCount,
     });
   }, undefined, (record) => {
+    // Every manager activation publishes its live object before persistence can
+    // early-return (notably for memory agents). Other activations use this to
+    // wake idle aggregated widgets and fleets.
+    publishFleetRecordChanged(record);
     const parentSession = (record.parentSessionId ? parentSessionsById.get(record.parentSessionId) : undefined)
       ?? parentSessionsByRoot.get(record.lineage.rootAgentId);
     const storePath = record.invocation?.sessionPersistence === "memory"
@@ -653,6 +664,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
   }, (record) => {
+    publishFleetRecordRemoved(record.id);
     if (mailboxActivationClosed) return;
     if (record.invocation?.sessionPersistence === "memory") {
       mailboxService.unregisterParticipant(record.lineage);
@@ -727,6 +739,8 @@ export default function (pi: ExtensionAPI) {
         ctx.getSystemPrompt?.(),
       );
       fleet.setCurrentIdentity(lineage);
+      // The Fleet root changed; immediately recompute which records the Widget owns.
+      widget.update();
       parentSessionsByRoot.set(lineage.rootAgentId, ctx.sessionManager);
       parentSessionsById.set(ctx.sessionManager.getSessionId(), ctx.sessionManager);
       activationLineages.set(ctx.sessionManager.getSessionId(), { lineage, cwd: ctx.cwd });
@@ -807,6 +821,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_before_switch", () => {
     fleet.onSessionBeforeSwitch();
     manager.clearCompleted(true);
+    // Suspended Fleet has no current root, so Widget temporarily covers every
+    // remaining mode-eligible record and cannot leave background runs in a switch blind spot.
+    widget.update();
     scheduler.stop();
     // Do not unregister the old root here: its background Agents keep running and
     // may enqueue durable mail while the user views another session.
@@ -815,6 +832,8 @@ export default function (pi: ExtensionAPI) {
   // On shutdown, abort all agents immediately and clean up.
   // If the session is going down, there's nothing left to consume agent results.
   pi.on("session_shutdown", async () => {
+    // Stop receiving process-global UI changes before abort callbacks publish.
+    unsubscribeFleetRegistry();
     // Set this before aborting: abort/completion callbacks can run during shutdown.
     mailboxActivationClosed = true;
     rpcHandle?.unsubSpawn();
@@ -838,6 +857,7 @@ export default function (pi: ExtensionAPI) {
     if (batchFinalizeTimer) clearTimeout(batchFinalizeTimer);
     batchFinalizeTimer = undefined;
     currentBatchAgents = [];
+    widget.dispose();
     fleet.dispose();
     manager.dispose();
     // Abort/dispose first: their callbacks may still touch mailbox registration.
@@ -848,21 +868,77 @@ export default function (pi: ExtensionAPI) {
     ownedMailboxRootIds.clear();
   });
 
-  // Live widget: show running agents above editor.
-  // widgetMode (default "background") selects what the widget shows: "all" =
-  // every agent; "background" = hide foreground (they already render inline as
-  // the Agent tool result, so showing them here too is a duplicate, #118), keep
-  // everything else; "off" = hide the widget entirely. Read live at render time.
+  // Fleet owns only the current session root. The above-editor Widget remains the
+  // fallback for foreign roots that keep running across session switches. The
+  // record predicate is live: when Fleet is off or has no bound root, Widget owns
+  // every record permitted by the user's mode.
   let widgetMode: WidgetMode = "background";
-  function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode);
-  function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
-
-  // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  const fleet = new FleetList(manager, agentActivity);
   let fleetViewEnabled = true;
+  function getWidgetMode(): WidgetMode { return widgetMode; }
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
-  function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
+
+  // Construct Fleet first because Widget's ownership predicate reads its identity.
+  const fleet = new FleetList(manager, agentActivity);
+  let widgetActivityOwners = new WeakMap<AgentRecord, FleetOwnerProvider>();
+  let widgetFallbackRecords = new WeakSet<AgentRecord>();
+  const widgetRecordSource = (): AgentRecord[] => {
+    const handles = listFleetAgentHandles();
+    if (handles.length === 0) {
+      // Before session_start registers the owner (or after teardown), preserve the
+      // historical current-manager behavior rather than leaving the Widget blind.
+      const records = manager.listAgents();
+      widgetActivityOwners = new WeakMap();
+      widgetFallbackRecords = new WeakSet(records);
+      return records;
+    }
+    const owners = new WeakMap<AgentRecord, FleetOwnerProvider>();
+    for (const handle of handles) owners.set(handle.record, handle.provider);
+    widgetActivityOwners = owners;
+    widgetFallbackRecords = new WeakSet();
+    return handles.map(handle => handle.record);
+  };
+  const widgetActivityResolver = (record: AgentRecord): AgentActivity | undefined => {
+    const owner = widgetActivityOwners.get(record);
+    if (owner) return owner.getActivity(record.id);
+    // ID lookup is safe only for the explicit single-manager fallback records.
+    return widgetFallbackRecords.has(record) ? agentActivity.get(record.id) : undefined;
+  };
+  const widget = new AgentWidget(
+    manager,
+    agentActivity,
+    getWidgetMode,
+    record => {
+      if (!fleetViewEnabled) return true;
+      const currentRootAgentId = fleet.getCurrentRootAgentId();
+      return currentRootAgentId === undefined || record.lineage.rootAgentId !== currentRootAgentId;
+    },
+    widgetRecordSource,
+    widgetActivityResolver,
+  );
+  const unsubscribeFleetRegistry = subscribeFleetRegistry(change => {
+    if (change.type === "changed") {
+      const { record } = change;
+      if (record.status !== "running" && record.status !== "queued") {
+        // Aggregated foreign completions do not pass through this activation's
+        // completion callback, so initialize turn-based linger bookkeeping here.
+        widget.markFinished(record.id);
+      }
+    }
+    // Updates only read registry/manager state and never publish, so notifying
+    // the current owner as well as foreign activations is recursion-safe.
+    widget.update();
+    fleet.update();
+  });
+  function setWidgetMode(m: WidgetMode): void {
+    widgetMode = m;
+    widget.update();
+  }
+  function setFleetViewEnabled(b: boolean): void {
+    fleetViewEnabled = b;
+    fleet.setEnabled(b);
+    // Recompute record ownership immediately in both directions.
+    widget.update();
+  }
 
   // Project/global default for writing the subagent .output transcript. A custom
   // agent's `output_transcript` frontmatter overrides this per spawn; when the
@@ -2813,14 +2889,14 @@ ${systemPrompt}
         {
           id: "fleetView",
           label: "Fleet view",
-          description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
+          description: "Default current-root tree below the editor; Widget deduplicates that root but keeps foreign roots visible (↓/← navigate, Enter view)",
           currentValue: isFleetViewEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
         {
           id: "widgetMode",
           label: "Widget",
-          description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
+          description: "Above-editor fallback: Fleet omits its current root only; foreign roots remain. all = every eligible agent; background = hide foreground; off = hidden.",
           currentValue: getWidgetMode(),
           values: ["all", "background", "off"],
         },

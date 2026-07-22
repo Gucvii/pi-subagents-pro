@@ -279,6 +279,20 @@ export class AgentWidget {
      * extension supplies one defaulting to `"background"`.
      */
     private mode: () => WidgetMode = () => "all",
+    /**
+     * Optional live record filter applied after `mode`. This lets another status
+     * surface own only the records it can currently represent without globally
+     * suppressing the widget. Existing callers default to accepting every record.
+     */
+    private recordPredicate: (record: AgentRecord) => boolean = () => true,
+    /**
+     * Optional live record source. The default preserves the historical single-manager
+     * behavior; fleet wiring can instead aggregate records owned by several managers.
+     */
+    private recordSource: () => AgentRecord[] = () => this.manager.listAgents(),
+    /** Resolve activity from the manager that owns this exact live record. */
+    private activityResolver: (record: AgentRecord) => AgentActivity | undefined =
+      record => this.agentActivity.get(record.id),
   ) {}
 
   /**
@@ -293,12 +307,29 @@ export class AgentWidget {
    *   - `all`: every agent.
    */
   private widgetAgents() {
-    const all = this.manager.listAgents();
-    switch (this.mode()) {
-      case "off": return [];
-      case "background": return all.filter(a => a.isBackground !== false);
-      default: return all;
+    let all: AgentRecord[];
+    try {
+      const records = this.recordSource();
+      all = Array.isArray(records) ? records : [];
+    } catch {
+      // A broken optional source must not break the host TUI.
+      all = [];
     }
+    const modeFiltered = (() => {
+      switch (this.mode()) {
+        case "off": return [];
+        case "background": return all.filter(a => a.isBackground !== false);
+        default: return all;
+      }
+    })();
+    return modeFiltered.filter(record => {
+      try { return this.recordPredicate(record); } catch { return false; }
+    });
+  }
+
+  /** A broken activity provider affects only its own record. */
+  private activityFor(record: AgentRecord): AgentActivity | undefined {
+    try { return this.activityResolver(record); } catch { return undefined; }
   }
 
   /** Set the UI context (grabbed from first tool execution). */
@@ -348,7 +379,7 @@ export class AgentWidget {
   }
 
   /** Render a finished agent line. */
-  private renderFinishedLine(a: { id: string; type: SubagentType; status: string; description: string; toolUses: number; startedAt: number; completedAt?: number; error?: string; invocation?: AgentInvocation }, theme: Theme): string {
+  private renderFinishedLine(a: AgentRecord, theme: Theme): string {
     const name = getDisplayName(a.type);
     const modeLabel = getPromptModeLabel(a.type);
     const duration = formatMs((a.completedAt ?? Date.now()) - a.startedAt);
@@ -377,7 +408,7 @@ export class AgentWidget {
     const parts: string[] = [];
     const identity = formatInvocationIdentity(a.invocation, true);
     if (identity) parts.push(identity);
-    const activity = this.agentActivity.get(a.id);
+    const activity = this.activityFor(a);
     if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
     if (a.toolUses > 0) parts.push(`${a.toolUses} tool use${a.toolUses === 1 ? "" : "s"}`);
     parts.push(duration);
@@ -426,7 +457,7 @@ export class AgentWidget {
       const modeTag = modeLabel ? ` ${theme.fg("dim", `(${modeLabel})`)}` : "";
       const elapsed = formatMs(Date.now() - a.startedAt);
 
-      const bg = this.agentActivity.get(a.id);
+      const bg = this.activityFor(a);
       const toolUses = bg?.toolUses ?? a.toolUses;
       const tokens = getLifetimeTotal(bg?.lifetimeUsage);
       const contextPercent = getSessionContextPercent(bg?.session);
@@ -539,6 +570,9 @@ export class AgentWidget {
       else if (a.completedAt && this.shouldShowFinished(a.id, a.status)) { hasFinished = true; }
     }
     const hasActive = runningCount > 0 || queuedCount > 0;
+    // Cross-manager publication can wake this widget after its idle timer stopped.
+    // Restart animation/polling whenever an update discovers active records.
+    if (hasActive) this.ensureTimer();
 
     // Nothing to show — clear widget
     if (!hasActive && !hasFinished) {

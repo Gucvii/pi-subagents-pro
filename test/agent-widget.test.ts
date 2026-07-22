@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { deriveAgentDescription, formatPromptPreview, renderAgentCallCard, renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatInvocationIdentity, formatSessionTokens, formatTurns } from "../src/ui/agent-widget.js";
@@ -143,7 +143,7 @@ describe("AgentWidget", () => {
     };
   }
 
-  function makeRecord(id: string, opts: { isBackground?: boolean } = {}) {
+  function makeRecord(id: string, opts: { isBackground?: boolean; rootAgentId?: string } = {}) {
     return {
       id,
       type: "general-purpose",
@@ -154,15 +154,22 @@ describe("AgentWidget", () => {
       lifetimeUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       compactionCount: 0,
       isBackground: opts.isBackground,
+      lineage: { agentId: id, parentAgentId: opts.rootAgentId ?? "root", rootAgentId: opts.rootAgentId ?? "root", depth: 1, maxTreeLevels: 3 },
     };
   }
 
   /** Render the widget for a manager and return the produced lines ("" if nothing rendered). */
-  function renderLines(manager: unknown, activityId: string, mode?: () => WidgetMode): string {
+  function renderLines(
+    manager: unknown,
+    activityId: string,
+    mode?: () => WidgetMode,
+    predicate?: (record: ReturnType<typeof makeRecord>) => boolean,
+  ): string {
     const widget = new AgentWidget(
       manager as any,
       new Map([[activityId, makeActivity()]]),
       mode,
+      predicate,
     );
     let factory: any;
     widget.setUICtx({
@@ -208,6 +215,116 @@ describe("AgentWidget", () => {
   it("keeps agents with no isBackground flag in 'background' mode", () => {
     const manager = { listAgents: () => [makeRecord("unflagged", {})] };
     expect(renderLines(manager, "unflagged", () => "background")).toContain("unflagged description");
+  });
+
+  it("applies the optional record predicate after mode filtering", () => {
+    const foreground = makeRecord("foreground", { isBackground: false, rootAgentId: "foreign" });
+    const current = makeRecord("current", { isBackground: true, rootAgentId: "current-root" });
+    const foreign = makeRecord("foreign", { isBackground: true, rootAgentId: "foreign-root" });
+    const manager = { listAgents: () => [foreground, current, foreign] };
+    const seen: string[] = [];
+    const lines = renderLines(manager, "foreign", () => "background", record => {
+      seen.push(record.id);
+      return record.lineage.rootAgentId !== "current-root";
+    });
+
+    expect(seen).toEqual(["current", "foreign", "current", "foreign"]); // update + render; foreground was removed by mode first
+    expect(lines).toContain("foreign description");
+    expect(lines).not.toContain("current description");
+    expect(lines).not.toContain("foreground description");
+  });
+
+  it("uses live records and resolves activity by record identity while isolating provider errors", () => {
+    const broken = { ...makeRecord("same"), description: "broken owner" };
+    const healthy = { ...makeRecord("same"), description: "healthy owner" };
+    const healthyActivity: AgentActivity = {
+      ...makeActivity(),
+      turnCount: 9,
+      maxTurns: 10,
+      toolUses: 3,
+      lifetimeUsage: { input: 2_000, output: 0, cacheRead: 0, cacheWrite: 0 },
+    };
+    const owners = new WeakMap<object, "broken" | "healthy">([
+      [broken, "broken"],
+      [healthy, "healthy"],
+    ]);
+    const widget = new AgentWidget(
+      { listAgents: () => [] } as any,
+      new Map(),
+      () => "all",
+      () => true,
+      () => [broken, healthy],
+      record => {
+        if (owners.get(record) === "broken") throw new Error("provider failed");
+        return owners.get(record) === "healthy" ? healthyActivity : undefined;
+      },
+    );
+    let factory: any;
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_key, content) => { factory = content; },
+    });
+    widget.update();
+    const lines = factory({ terminal: { columns: 160 }, requestRender: () => {} }, theme).render().join("\n");
+
+    expect(lines).toContain("broken owner");
+    expect(lines).toContain("healthy owner");
+    expect(lines).toContain("↻ 9≤10");
+    expect(lines).toContain("3 tool uses");
+    expect(lines).toContain("2.0k");
+  });
+
+  it("supports live current-root deduplication with Fleet off and suspended fallbacks", () => {
+    const rootA = makeRecord("agent-A", { isBackground: true, rootAgentId: "root-A" });
+    const rootB = makeRecord("agent-B", { isBackground: true, rootAgentId: "root-B" });
+    const manager = { listAgents: () => [rootA, rootB] };
+    let fleetEnabled = true;
+    let currentRoot: string | undefined = "root-A";
+    const predicate = (record: ReturnType<typeof makeRecord>) =>
+      !fleetEnabled || currentRoot === undefined || record.lineage.rootAgentId !== currentRoot;
+    const render = () => renderLines(manager, "agent-A", () => "all", predicate);
+
+    expect(render()).not.toContain("agent-A description");
+    expect(render()).toContain("agent-B description");
+    currentRoot = "root-B";
+    expect(render()).toContain("agent-A description");
+    expect(render()).not.toContain("agent-B description");
+    fleetEnabled = false;
+    expect(render()).toContain("agent-A description");
+    expect(render()).toContain("agent-B description");
+    fleetEnabled = true;
+    currentRoot = undefined;
+    expect(render()).toContain("agent-A description");
+    expect(render()).toContain("agent-B description");
+  });
+
+  it("restarts its stopped interval when an update discovers an active external record", () => {
+    vi.useFakeTimers();
+    try {
+      const records: ReturnType<typeof makeRecord>[] = [];
+      const source = vi.fn(() => records);
+      const widget = new AgentWidget(
+        { listAgents: () => [] } as any,
+        new Map(),
+        () => "all",
+        () => true,
+        source,
+      );
+      widget.setUICtx({ setStatus: vi.fn(), setWidget: vi.fn() });
+      widget.update();
+      const idleCalls = source.mock.calls.length;
+      vi.advanceTimersByTime(500);
+      expect(source).toHaveBeenCalledTimes(idleCalls);
+
+      records.push(makeRecord("external"));
+      widget.update();
+      const discoveredCalls = source.mock.calls.length;
+      vi.advanceTimersByTime(250);
+      expect(source.mock.calls.length).toBeGreaterThan(discoveredCalls);
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   // "off" hides the widget entirely — even a background agent renders nothing.

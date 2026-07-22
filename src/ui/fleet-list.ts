@@ -3,7 +3,7 @@ import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } 
 import type { AgentManager } from "../agent-manager.js";
 import type { AgentLineage, AgentRecord } from "../types.js";
 import { getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, getDisplayName, type Theme } from "./agent-widget.js";
+import { type AgentActivity, formatTurns, getDisplayName, type Theme } from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 import { type FleetOwnerProvider, isFleetOwnerRegistered, listFleetAgentHandles, registerFleetOwner } from "./fleet-registry.js";
 import { agentFleetKey, buildFleetTree, isValidFleetCurrentLineage, mainFleetKey, type VisibleFleetNode, visibleFleetPreorder } from "./fleet-tree.js";
@@ -37,16 +37,17 @@ export function formatFleetTokens(count: number): string {
   if (count >= 1_000_000) compact = `${(count / 1_000_000).toFixed(1)}M`;
   else if (count >= 1_000) compact = `${(count / 1_000).toFixed(1)}k`;
   else compact = `${count}`;
-  return `↓ ${compact} tokens`;
+  return `↓ ${compact}`;
 }
 
-function rightAlign(left: string, right: string, width: number): string {
+export function rightAlign(left: string, right: string, width: number): string {
   if (width <= 0) return "";
   const rightW = visibleWidth(right);
-  const maxLeft = Math.max(0, width - rightW - 1);
+  if (rightW >= width) return truncateToWidth(right, width);
+  const maxLeft = width - rightW - 1;
   const leftClamped = truncateToWidth(left, maxLeft);
   const gap = Math.max(1, width - visibleWidth(leftClamped) - rightW);
-  return truncateToWidth(leftClamped + " ".repeat(gap) + right, width);
+  return leftClamped + " ".repeat(gap) + right;
 }
 
 interface FleetViewState {
@@ -63,6 +64,8 @@ export class FleetList {
   private timer: ReturnType<typeof setInterval> | undefined;
   private enabled = true;
   private active = false;
+  /** Manual hide survives navigation exit, but not a genuinely empty tree. */
+  private dismissed = false;
   private selectedKey: string | undefined;
   private collapsed = new Set<string>();
   private viewerClose: (() => void) | undefined;
@@ -87,6 +90,11 @@ export class FleetList {
     };
   }
 
+  /** Root currently projected by Fleet; absent while unbound or session-switch suspended. */
+  getCurrentRootAgentId(): string | undefined {
+    return this.suspended ? undefined : this.currentIdentity?.rootAgentId;
+  }
+
   /** Bound session identity; registration begins only after a real session_start. */
   setCurrentIdentity(identity: AgentLineage): void {
     if (this.disposed || !isValidFleetCurrentLineage(identity)) return;
@@ -97,6 +105,7 @@ export class FleetList {
     this.suspended = false;
     this.currentIdentity = { ...identity };
     if (changed) {
+      this.dismissed = false;
       this.selectedKey = mainFleetKey(identity.agentId);
       this.collapsed.clear();
     }
@@ -113,6 +122,7 @@ export class FleetList {
     this.suspended = true;
     this.currentIdentity = undefined;
     this.active = false;
+    this.dismissed = false;
     this.selectedKey = undefined;
     this.collapsed.clear();
     close?.();
@@ -122,7 +132,10 @@ export class FleetList {
   setEnabled(enabled: boolean): void {
     if (enabled === this.enabled) return;
     this.enabled = enabled;
-    if (!enabled) this.active = false;
+    if (!enabled) {
+      this.active = false;
+      this.dismissed = false;
+    }
     this.update();
   }
 
@@ -161,15 +174,20 @@ export class FleetList {
   update(): void {
     if (!this.ui) return;
     const view = this.viewState();
-    const hasAgents = this.enabled && Boolean(view && view.tree.byKey.size > 1);
-    if (!hasAgents) {
+    const treeHasAgents = Boolean(view && view.tree.byKey.size > 1);
+
+    // Disabled/suspended/empty are true teardown states. A manual dismissal is
+    // only a render state: retain the one widget component (and its TUI focus
+    // context) so restoration cannot guess who currently owns the keyboard.
+    if (!this.enabled || !treeHasAgents) {
       if (this.widgetRegistered) {
         this.ui.setWidget(FLEET_KEY, undefined);
         this.widgetRegistered = false;
         this.tui = undefined;
       }
-      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       this.active = false;
+      if (!treeHasAgents) this.dismissed = false;
+      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
       if (view) this.selectedKey = mainFleetKey(view.current.agentId);
       return;
     }
@@ -193,14 +211,37 @@ export class FleetList {
   private eligibleHandles(): { current: AgentLineage; handles: ReturnType<typeof listFleetAgentHandles> } | undefined {
     if (this.suspended || !this.currentIdentity) return undefined;
     const now = Date.now();
-    const all = listFleetAgentHandles();
     const current = this.currentIdentity;
-    const handles = all.filter(({ record }) => record.session && (
-      record.status === "running" || record.status === "queued"
-      || record.id === this.viewingAgentId
-      || (record.completedAt != null && now - record.completedAt < FINISHED_LINGER_MS)
-    ));
-    return { current, handles };
+    const rooted = listFleetAgentHandles().filter(({ record }) =>
+      record.lineage?.rootAgentId === current.rootAgentId);
+    // Every same-root record may be needed as a structural ancestor, even when its
+    // completed session has already been released. Only starting display nodes require
+    // an open session (or the special queued-before-session state).
+    const candidates = rooted.filter(({ record }) => Boolean(record.session) || record.status === "queued");
+    const byId = new Map(rooted.map(handle => [handle.record.id, handle]));
+    const included = new Map<string, (typeof rooted)[number]>();
+
+    for (const handle of candidates) {
+      const { record } = handle;
+      const baseEligible = record.status === "running" || record.status === "queued"
+        || record.id === this.viewingAgentId
+        || (record.completedAt != null && now - record.completedAt < FINISHED_LINGER_MS);
+      if (!baseEligible) continue;
+
+      included.set(record.id, handle);
+      // Preserve real, live-record ancestor handles for eligible descendants. The
+      // tree builder still validates every edge and exposes genuinely absent parents.
+      let parentId = record.lineage.parentAgentId;
+      const seen = new Set<string>([record.id]);
+      while (parentId && parentId !== current.agentId && !seen.has(parentId)) {
+        seen.add(parentId);
+        const parent = byId.get(parentId);
+        if (!parent) break;
+        included.set(parent.record.id, parent);
+        parentId = parent.record.lineage.parentAgentId;
+      }
+    }
+    return { current, handles: [...included.values()] };
   }
 
   private viewState(): FleetViewState | undefined {
@@ -221,16 +262,23 @@ export class FleetList {
 
   handleKey(data: string): { consume?: boolean; data?: string } | undefined {
     if (!this.enabled || !this.ui || isKeyRelease(data) || this.viewerClose) return undefined;
-    if (!this.editorHasFocus()) {
+    const focus = this.editorFocusState();
+    if (focus === "other") {
       if (this.active) this.deactivate();
       return undefined;
     }
+    // Before the widget has rendered, unknown focus historically means the prompt
+    // and keeps initial activation responsive. Once manually hidden, however,
+    // restoration is allowed only with affirmative Editor focus: unknown must
+    // fail open, and selectors/menus must always retain their keys.
+    if (this.dismissed && focus !== "editor") return undefined;
     const view = this.viewState();
     if (!view || view.tree.byKey.size <= 1) return undefined;
     this.reconcileSelection(view);
 
     if (!this.active) {
       if ((matchesKey(data, "down") || matchesKey(data, "left")) && this.ui.getEditorText() === "") {
+        this.dismissed = false;
         this.active = true;
         this.selectedKey = mainFleetKey(view.current.agentId);
         this.update();
@@ -244,6 +292,11 @@ export class FleetList {
     if (matchesKey(data, "down")) {
       this.selectedKey = view.visible[Math.min(view.visible.length - 1, index + 1)].node.key;
     } else if (matchesKey(data, "up")) {
+      if (selected.kind === "main") {
+        this.dismissed = true;
+        this.deactivate();
+        return { consume: true };
+      }
       this.selectedKey = view.visible[Math.max(0, index - 1)].node.key;
     } else if (matchesKey(data, "left")) {
       if (selected.children.length > 0 && !this.collapsed.has(selected.key)) this.collapsed.add(selected.key);
@@ -267,9 +320,10 @@ export class FleetList {
     return { consume: true };
   }
 
-  private editorHasFocus(): boolean {
+  private editorFocusState(): "editor" | "other" | "unknown" {
     const focused = (this.tui as { focusedComponent?: unknown } | undefined)?.focusedComponent;
-    return focused == null || focused instanceof Editor;
+    if (focused == null) return "unknown";
+    return focused instanceof Editor ? "editor" : "other";
   }
 
   private deactivate(): void {
@@ -352,13 +406,13 @@ export class FleetList {
   }
 
   private renderBar(width: number, theme: Theme): string[] {
-    if (width <= 0) return [];
+    if (!this.enabled || this.dismissed || width <= 0) return [];
     const view = this.viewState();
     if (!view || view.tree.byKey.size <= 1) return [];
     this.reconcileSelection(view);
     const hint = this.active
-      ? "↑↓ move · ←→ collapse/open · enter view · esc back"
-      : "esc to interrupt · ← for agents · ↓ to manage";
+      ? "↑↓ move · ↑ at top hide · ←→ collapse/open · enter view · esc back"
+      : "esc to interrupt · ←/↓ manage";
     const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
     const mainVisible = view.visible[0];
     lines.push(this.renderNode(mainVisible, width, theme));
@@ -387,8 +441,12 @@ export class FleetList {
     const displayType = getDisplayName(record.type);
     const type = displayType === "Agent" ? "" : theme.fg("dim", ` (${displayType})`);
     const description = this.descriptionPresentation(record, theme);
-    const left = `  ${prefix}${bullet} ${disclosure} ${description}${type}${orphan}`;
     const activity = this.safeActivity(node.handle!.provider, record.id);
+    const metadata = this.metadataPresentation(record, activity, theme);
+    // Metadata deliberately trails the semantic identity. rightAlign clamps the
+    // left tail first, so narrow terminals preserve the tree/description and the
+    // fixed elapsed/token block rather than wrapping a second details row.
+    const left = `  ${prefix}${bullet} ${disclosure} ${description}${type}${orphan}${metadata}`;
     const tokens = getLifetimeTotal(activity?.lifetimeUsage ?? record.lifetimeUsage);
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt;
     const right = theme.fg("dim", `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}`);
@@ -397,6 +455,18 @@ export class FleetList {
 
   private safeActivity(provider: FleetOwnerProvider, agentId: string): AgentActivity | undefined {
     try { return provider.getActivity(agentId); } catch { return undefined; }
+  }
+
+  private metadataPresentation(record: AgentRecord, activity: AgentActivity | undefined, theme: Theme): string {
+    const parts: string[] = [];
+    const modelName = record.invocation?.modelName;
+    if (modelName) parts.push(modelName.includes("/") ? modelName.slice(modelName.indexOf("/") + 1) : modelName);
+    if (record.invocation?.thinking) parts.push(record.invocation.thinking);
+    parts.push(record.invocation?.sessionPersistence ?? "durable");
+    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+    const toolUses = activity?.toolUses ?? record.toolUses;
+    if (toolUses > 0) parts.push(`${toolUses} tool${toolUses === 1 ? "" : "s"}`);
+    return parts.length > 0 ? `  ${theme.fg("dim", parts.join(" · "))}` : "";
   }
 
   private descriptionPresentation(record: AgentRecord, theme: Theme): string {

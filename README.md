@@ -7,8 +7,8 @@ A product-focused subagent harness for [Pi](https://pi.dev). Subagents inherit t
 
 - **Claude Code look & feel** — native-style tool names, calling conventions, and UI patterns (`Agent`, `inspect_agent`, `read_agent_entry`, `get_subagent_result`, `steer_subagent`, `stop_agent`, `mailbox`)
 - **Parallel background agents** — spawn multiple agents that run concurrently with automatic queuing (configurable concurrency limit, default 4) and smart group join (consolidated notifications)
-- **Live widget UI** — persistent above-editor widget with animated spinners, live tool activity, token counts, and colored status icons. Configurable via `/agents → Settings → Widget`: `all` (every agent), `background` (default — hides foreground runs, which already render inline as the `Agent` tool result), or `off`
-- **FleetView** — a true trusted-lineage tree of `main` and every openable descendant across dynamically nested Agent managers. Press `↓` (or `←`) at an empty prompt to jump in, `↑`/`↓` to move through visible preorder, `←`/`→` to collapse, expand, or move between parent/child, `Enter` to open the correctly routed live conversation, and `Esc` to return. Finished agents linger briefly and an open viewer stays through completion. Toggle via `/agents → Settings → Fleet view`; the separate `/agents` roster is unchanged
+- **Live widget UI** — above-editor fallback with animated spinners, live tool activity, token counts, and colored status icons. FleetView deduplicates only its current root; running Agents from other roots remain visible here. With FleetView off, the Widget shows all mode-eligible records using `/agents → Settings → Widget`: `all`, `background` (default), or `off`
+- **FleetView** — the default, automatically visible status projection: a true trusted-lineage tree of `main` and every openable descendant across dynamically nested Agent managers. Press `↓` (or `←`) at an empty prompt to navigate, `↑` on selected `main` to hide, and `↓`/`←` to restore. Finished ancestors remain while active descendants need them. Toggle via `/agents → Settings → Fleet view`; the separate `/agents` roster is unchanged
 - **Structured conversation viewer** — select any agent in `/agents` to open a live-scrolling, color-aware overlay organized by user turns and execution flow. Assistant Markdown keeps headings, lists, and code blocks; thinking and long successful tool output start collapsed; tool calls pair with their results and use semantic running/success/error states. Use the configured `app.tools.expand` binding (`Ctrl+O` by default) to toggle bounded details. Steer with `Enter`, stop with `x` then `x`, scroll as before, and close with `Esc`
 - **Custom agent types** — define reusable prompts, tools, skills, isolation policy, and optional model/effort pins in project or global Markdown files
 - **Mid-run steering** — inject messages into running agents to redirect their work without restarting
@@ -96,7 +96,7 @@ Restrictions:
 
 ## UI
 
-The extension renders a persistent widget above the editor showing active agents. By default it shows background runs only (`widgetMode: background`) — foreground agents already render inline as the `Agent` tool result, so the widget would otherwise double-render them. Switch to `all` (every agent) or `off` (hide the widget) via `/agents → Settings → Widget`:
+FleetView is the default status projection for the current root. To avoid duplicate rows, the above-editor Widget omits that root while FleetView owns it, but continues to show mode-eligible running Agents from other roots after a session switch—including nested descendants owned by other live Agent managers. Their activity, turns, and tokens are read from the exact owning manager rather than matched by globally ambiguous Agent ID. If FleetView is suspended or has no bound root, the Widget covers all mode-eligible records so there is no visibility gap. Turning FleetView off likewise shows all records allowed by the stored Widget choice: `background` (default; foreground runs already render inline), `all`, or `off`. Configure both under `/agents → Settings`:
 
 ```
 ● Agents
@@ -122,17 +122,17 @@ Opening an Agent from `/agents` or FleetView shows a structured overlay rather t
 While subagents are running, a Claude Code-style navigable list renders **below** the editor:
 
 ```
-  esc to interrupt · ← for agents · ↓ to manage
+  esc to interrupt · ←/↓ manage
 
   ⏺ ▾ main
-  ├─ ◯ ▾ Research API (Explore)                                      11s · ↓ 13.1k tokens
-  │  └─ ◯   Check tests (worker)                                      2s · ↓ 0 tokens
-  └─ ◯   Summarize findings (Plan)                                    8s · ↓ 4.2k tokens
+  ├─ ◯ ▾ Research API (Explore)  gpt-5.6-sol · medium · memory · ↻ 1≤20 · 1 tool  11s · ↓ 13.1k
+  │  └─ ◯   Check tests (worker)  gpt-5.6-sol · medium · memory · ↻ 2≤20            2s · ↓ 0
+  └─ ◯   Summarize findings (Plan)  gpt-5.6-sol · medium · durable · ↻ 1≤20         8s · ↓ 4.2k
 ```
 
-FleetView is a real tree projected only from trusted `parentAgentId`/`rootAgentId`/`depth` lineage. It reads every live nested manager at display time, so a root Fleet can see grandchildren and routes open/steer/stop back to the manager that owns each record; it does not copy records or become another source of truth. Missing-parent deeper records are shown explicitly as orphans rather than attached to an invented parent. Siblings are ordered by launch time, then ID.
+FleetView is a real tree projected only from trusted `parentAgentId`/`rootAgentId`/`depth` lineage. It reads every live nested manager at display time, so a root Fleet can see grandchildren and routes open/steer/stop back to the manager that owns each record; it does not copy records or become another source of truth. An active or lingering descendant retains its real completed ancestor handles even after the ancestors' own four-second linger expires, keeping the complete selectable chain. Missing parents remain explicit orphans rather than invented nodes. Siblings are ordered by launch time, then ID.
 
-Only agents with an openable session appear (queued agents without one appear once they start). At an **empty prompt**, press `↓` (or `←`) to activate the tree. `↑`/`↓` move through visible preorder. `←` collapses an expanded node, otherwise moves to its parent; on `main`, press it again after collapse to exit. `→` expands a collapsed node, otherwise enters its first child. `Enter` opens the selected live conversation and `Esc` exits. Inside the overlay, `Enter` steers and `x`, `x` stops through the selected agent's owning manager. A viewer stays open through completion, and finished agents linger for about four seconds. At most five visible agent nodes render at once, with the selected identity kept in view even as managers reorder or update. Every line is width-clamped. FleetView does not change the separate `/agents` roster. Disable it via `/agents → Settings → Fleet view`.
+Running agents with an openable session and queued agents awaiting one appear immediately, and the tree renders automatically before any keypress. Pressing `Enter` on a sessionless queued row reports that no session is available yet. Each Agent occupies exactly one row: tree/selection/disclosure, description and non-generic type, then dimmed short model ID, thinking level, persistence, turns, and nonzero tool count; elapsed time and compact `↓ 16.9k` usage remain right-aligned. Live activity text such as `running command…` is intentionally not rendered, and narrow terminals truncate the left-tail metadata before the fixed right stats. At an **empty prompt**, press `↓` (or `←`) to activate it. `↑`/`↓` move through visible preorder; pressing `↑` while active on `main` manually hides the tree without consuming inactive editor-history `↑`. From hidden, empty-prompt `↓` or `←` restores and activates it only while the prompt editor explicitly owns focus; selectors and menus retain their keys, and unknown focus fails open. `Esc` only exits navigation and leaves the tree visible. Dismissal resets after the tree truly becomes empty, so the next Agent batch auto-appears. `←`/`→` collapse, expand, and move through parent/child nodes; `Enter` opens the selected conversation. Inside the overlay, `Enter` steers and `x`, `x` stops through the owning manager. A viewer stays open through completion, and finished branches linger for about four seconds. At most five visible agent nodes render at once. FleetView does not change `/agents`; disable it via `/agents → Settings → Fleet view`, which restores the configured Widget mode.
 
 Individual agent results render Claude Code-style in the conversation:
 

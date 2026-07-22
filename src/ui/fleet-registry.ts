@@ -17,7 +17,16 @@ export interface FleetAgentHandle {
   provider: FleetOwnerProvider;
 }
 
-type FleetRegistryState = { owners: Map<object, FleetOwnerProvider> };
+export type FleetRegistryChange =
+  | { type: "changed"; record: AgentRecord }
+  | { type: "removed"; agentId: string };
+
+export type FleetRegistryListener = (change: FleetRegistryChange) => void;
+
+type FleetRegistryState = {
+  owners: Map<object, FleetOwnerProvider>;
+  listeners: Set<FleetRegistryListener>;
+};
 
 function state(): FleetRegistryState {
   const global = globalThis as Record<symbol, unknown>;
@@ -26,9 +35,18 @@ function state(): FleetRegistryState {
     if (!existing || typeof existing !== "object" || !((existing as FleetRegistryState).owners instanceof Map)) {
       throw new Error("Fleet owner registry is invalid.");
     }
-    return existing as FleetRegistryState;
+    const compatible = existing as Partial<FleetRegistryState> & Pick<FleetRegistryState, "owners">;
+    // Older copies in the same process created an owners-only state. Preserve its
+    // live Map while upgrading the container (also works if the old object is frozen).
+    if (compatible.listeners === undefined) {
+      const upgraded: FleetRegistryState = { owners: compatible.owners, listeners: new Set() };
+      global[REGISTRY_KEY] = upgraded;
+      return upgraded;
+    }
+    if (!(compatible.listeners instanceof Set)) throw new Error("Fleet owner registry listeners are invalid.");
+    return compatible as FleetRegistryState;
   }
-  const created: FleetRegistryState = { owners: new Map() };
+  const created: FleetRegistryState = { owners: new Map(), listeners: new Set() };
   global[REGISTRY_KEY] = created;
   return created;
 }
@@ -74,12 +92,48 @@ export function isFleetOwnerRegistered(provider: FleetOwnerProvider): boolean {
   return state().owners.get(provider.owner) === provider;
 }
 
+/** Subscribe to process-global record changes. Unsubscribe is safe and idempotent. */
+export function subscribeFleetRegistry(listener: FleetRegistryListener): () => void {
+  if (typeof listener !== "function") throw new TypeError("Fleet registry listener must be a function.");
+  const listeners = state().listeners;
+  listeners.add(listener);
+  let subscribed = true;
+  return () => {
+    if (!subscribed) return;
+    subscribed = false;
+    listeners.delete(listener);
+  };
+}
+
+/** Publish the actual live record; listeners must not retain a copied registry snapshot. */
+export function publishFleetRecordChanged(record: AgentRecord): void {
+  publish({ type: "changed", record });
+}
+
+/** Publish only the identity needed to refresh views after a record is removed. */
+export function publishFleetRecordRemoved(agentId: string): void {
+  publish({ type: "removed", agentId });
+}
+
+function publish(change: FleetRegistryChange): void {
+  // Snapshot iteration makes subscribe/unsubscribe during delivery deterministic.
+  for (const listener of [...state().listeners]) {
+    try { listener(change); } catch { /* one broken activation cannot block others */ }
+  }
+}
+
 /** Test-only observable avoids tests reaching into process-global private state. */
 export function getFleetRegistrySizeForTests(): number {
   return state().owners.size;
 }
 
+export function getFleetRegistryListenerCountForTests(): number {
+  return state().listeners.size;
+}
+
 /** Test-only process-global cleanup, mirroring AgentRuntimeTree.resetForTests(). */
 export function resetFleetRegistryForTests(): void {
-  state().owners.clear();
+  const registry = state();
+  registry.owners.clear();
+  registry.listeners.clear();
 }
