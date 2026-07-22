@@ -454,9 +454,11 @@ describe("FleetList rendering", () => {
       lifetimeUsage: record.lifetimeUsage,
     }]]);
     const lines = harness([record], activity).render(200);
-    // hint + blank + main + exactly one row for this agent; no activity row.
+    // hint + AGENTS heading + main + exactly one agent row; no activity row.
     expect(lines).toHaveLength(4);
     expect(lines[0]).toContain("←/↓ manage");
+    expect(lines[1]).toContain("AGENTS");
+    expect(lines[1]).not.toBe("");
     expect(lines.find(l => l.includes("main"))).toContain("⏺"); // main selected by default
     const agentLines = lines.filter(l => l.includes("Sleep then report 1"));
     expect(agentLines).toHaveLength(1);

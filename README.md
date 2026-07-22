@@ -123,7 +123,7 @@ While subagents are running, a Claude Code-style navigable list renders **below*
 
 ```
   esc to interrupt · ←/↓ manage
-
+AGENTS
   ⏺ ▾ main
   ├─ ◯ ▾ Research API (Explore)  gpt-5.6-sol · medium · memory · ↻ 1≤20 · 1 tool  11s · ↓ 13.1k
   │  └─ ◯   Check tests (worker)  gpt-5.6-sol · medium · memory · ↻ 2≤20            2s · ↓ 0

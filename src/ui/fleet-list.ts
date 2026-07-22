@@ -413,7 +413,10 @@ export class FleetList {
     const hint = this.active
       ? "↑↓ move · ↑ at top hide · ←→ collapse/open · enter view · esc back"
       : "esc to interrupt · ←/↓ manage";
-    const lines = [truncateToWidth(`  ${theme.fg("dim", hint)}`, width), ""];
+    const lines = [
+      truncateToWidth(`  ${theme.fg("dim", hint)}`, width),
+      truncateToWidth(theme.bold(theme.fg("accent", "AGENTS")), width),
+    ];
     const mainVisible = view.visible[0];
     lines.push(this.renderNode(mainVisible, width, theme));
 
